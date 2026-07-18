@@ -5,6 +5,7 @@ from __future__ import annotations
 import math
 import sqlite3
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -14,6 +15,7 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 
 from .models import (
+    Holding,
     HoldingsFile,
     Snapshot,
     SnapshotInstrument,
@@ -22,8 +24,53 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 SYDNEY = ZoneInfo("Australia/Sydney")
+
+
+@dataclass(frozen=True, slots=True)
+class _FactorCandidate:
+    instrument_id: int
+    trade_date: str
+    previous_trade_date: str | None
+    open_to_previous_close: float | None
+    high_to_previous_close: float | None
+    low_to_previous_close: float | None
+    close_to_previous_close: float | None
+    total_return_factor: float | None
+    volume: float | None
+    source_run_id: int
+    created_at: str
+
+    def insert_parameters(self) -> tuple[object, ...]:
+        return (
+            self.instrument_id,
+            self.trade_date,
+            self.previous_trade_date,
+            self.open_to_previous_close,
+            self.high_to_previous_close,
+            self.low_to_previous_close,
+            self.close_to_previous_close,
+            self.total_return_factor,
+            self.volume,
+            self.source_run_id,
+            self.created_at,
+        )
+
+    def update_parameters(self) -> tuple[object, ...]:
+        return (
+            self.previous_trade_date,
+            self.open_to_previous_close,
+            self.high_to_previous_close,
+            self.low_to_previous_close,
+            self.close_to_previous_close,
+            self.total_return_factor,
+            self.volume,
+            self.source_run_id,
+            self.created_at,
+            self.instrument_id,
+            self.trade_date,
+        )
 
 
 SCHEMA = """
@@ -138,15 +185,11 @@ CREATE TABLE IF NOT EXISTS factor_revisions (
     revised_at TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS sync_state (
+CREATE TABLE IF NOT EXISTS instrument_sync_state (
     instrument_id INTEGER PRIMARY KEY REFERENCES instruments(id),
     provider TEXT NOT NULL,
     backfill_attempted INTEGER NOT NULL DEFAULT 0,
-    checked_through TEXT,
     latest_trade_date TEXT,
-    consecutive_failures INTEGER NOT NULL DEFAULT 0,
-    retry_after TEXT,
-    last_error TEXT,
     updated_at TEXT NOT NULL
 );
 
@@ -254,19 +297,20 @@ class Database:
         # Version 0 covers both a new database and caches made before explicit
         # schema versioning. Migrations remain additive so an interrupted
         # upgrade can safely be opened again.
-        self.connection.executescript(SCHEMA)
-        # Verify additive invariants even when user_version was already bumped:
-        # a process can be interrupted between individual DDL statements.
-        self._migrate(schema_version)
-        if schema_version < SCHEMA_VERSION:
-            self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-        # `_migrate` is deliberately run for an apparently-current database so
-        # a partially applied v2 is self-healing. Persist those repairs even
-        # when the version number itself did not need changing.
-        self.connection.commit()
+        try:
+            self.connection.executescript(SCHEMA)
+            # Verify additive invariants even when user_version was already
+            # bumped: an interrupted migration must remain safe to reopen.
+            self._migrate()
+            if schema_version < SCHEMA_VERSION:
+                self.connection.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            self.connection.commit()
+        except Exception:
+            self.connection.rollback()
+            self.connection.close()
+            raise
 
-    def _migrate(self, schema_version: int) -> None:
-        del schema_version
+    def _migrate(self) -> None:
         columns = {
             row["name"]
             for row in self.connection.execute(
@@ -286,18 +330,57 @@ class Database:
             WHERE status = 'satisfied' AND history_start IS NULL
             """
         )
-        # Preserve the meaning of the old monolithic state as the initial
-        # forward state. History watermarks already persist completed depth.
-        self.connection.execute(
+        legacy_state_exists = self.connection.execute(
             """
-            INSERT OR IGNORE INTO sync_obligation_state
-                (instrument_id, obligation_type, checked_through,
-                 consecutive_failures, retry_after, last_error, updated_at)
-            SELECT instrument_id, 'forward', checked_through,
-                   consecutive_failures, retry_after, last_error, updated_at
-            FROM sync_state
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'sync_state'
             """
-        )
+        ).fetchone()
+        if legacy_state_exists is not None:
+            # v1/v2 mixed cache facts and retry state in one row. Split those
+            # responsibilities once, then remove the mirror rather than
+            # maintaining two competing sources of truth indefinitely.
+            self.connection.execute(
+                """
+                INSERT INTO instrument_sync_state
+                    (instrument_id, provider, backfill_attempted,
+                     latest_trade_date, updated_at)
+                SELECT instrument_id, provider, backfill_attempted,
+                       latest_trade_date, updated_at
+                FROM sync_state
+                WHERE true
+                ON CONFLICT (instrument_id) DO UPDATE SET
+                    backfill_attempted = MAX(
+                        instrument_sync_state.backfill_attempted,
+                        excluded.backfill_attempted
+                    ),
+                    latest_trade_date = CASE
+                        WHEN excluded.latest_trade_date IS NULL
+                            THEN instrument_sync_state.latest_trade_date
+                        WHEN instrument_sync_state.latest_trade_date IS NULL
+                            THEN excluded.latest_trade_date
+                        ELSE MAX(instrument_sync_state.latest_trade_date,
+                                 excluded.latest_trade_date)
+                    END,
+                    updated_at = MAX(instrument_sync_state.updated_at,
+                                     excluded.updated_at)
+                """
+            )
+            # Preserve the meaning of the old monolithic watermark and retry
+            # fields as the initial forward obligation state.
+            self.connection.execute(
+                """
+                INSERT INTO sync_obligation_state
+                    (instrument_id, obligation_type, checked_through,
+                     consecutive_failures, retry_after, last_error, updated_at)
+                SELECT instrument_id, 'forward', checked_through,
+                       consecutive_failures, retry_after, last_error, updated_at
+                FROM sync_state
+                WHERE true
+                ON CONFLICT (instrument_id, obligation_type) DO NOTHING
+                """
+            )
+            self.connection.execute("DROP TABLE sync_state")
 
     def close(self) -> None:
         self.connection.close()
@@ -346,12 +429,36 @@ class Database:
         *,
         universe_code: str,
     ) -> list[str]:
-        issues: list[str] = []
-        holdings = holdings_file.holdings
-        symbols = {holding.provider_symbol for holding in holdings}
-        if holdings_file.as_of_date > datetime.now(SYDNEY).date():
-            issues.append(f"holdings date {holdings_file.as_of_date} is in the future")
-        source_date = self.connection.execute(
+        symbols = {holding.provider_symbol for holding in holdings_file.holdings}
+        issues = _holdings_file_issues(
+            holdings_file,
+            universe_code=universe_code,
+            today=datetime.now(SYDNEY).date(),
+        )
+        source_date = self._source_import_date(universe_code, holdings_file.sha256)
+        if source_date is not None and source_date != holdings_file.as_of_date:
+            issues.append(
+                "the same workbook bytes were already imported with effective date "
+                f"{source_date}, not {holdings_file.as_of_date}"
+            )
+        issues.extend(self._instrument_identity_issues(holdings_file.holdings))
+
+        latest = self._latest_snapshot(universe_code)
+        if latest is None:
+            return issues
+        latest_date = date.fromisoformat(latest["as_of_date"])
+        previous_symbols = self._snapshot_provider_symbols(int(latest["id"]))
+        return issues + _snapshot_transition_issues(
+            holdings_date=holdings_file.as_of_date,
+            latest_date=latest_date,
+            symbols=symbols,
+            previous_symbols=previous_symbols,
+        )
+
+    def _source_import_date(
+        self, universe_code: str, source_sha256: str
+    ) -> date | None:
+        row = self.connection.execute(
             """
             SELECT s.as_of_date
             FROM universe_snapshots s
@@ -359,62 +466,41 @@ class Database:
             WHERE u.code = ? AND s.source_sha256 = ?
             LIMIT 1
             """,
-            (universe_code, holdings_file.sha256),
+            (universe_code, source_sha256),
         ).fetchone()
-        if (
-            source_date is not None
-            and source_date["as_of_date"] != holdings_file.as_of_date.isoformat()
-        ):
-            issues.append(
-                "the same workbook bytes were already imported with effective date "
-                f"{source_date['as_of_date']}, not {holdings_file.as_of_date}"
-            )
-        minimum_count = 200 if universe_code == "VAS" else 2
-        if len(symbols) < minimum_count:
-            issues.append(
-                f"only {len(symbols)} distinct holdings; expected at least {minimum_count}"
-            )
-        if len(symbols) != len(holdings):
-            issues.append("multiple workbook rows map to the same provider symbol")
+        return date.fromisoformat(row["as_of_date"]) if row is not None else None
 
-        if symbols:
-            placeholders = ",".join("?" for _ in symbols)
-            known_names = {
-                row["provider_symbol"]: row["name"]
-                for row in self.connection.execute(
-                    f"""
-                    SELECT provider_symbol, name FROM instruments
-                    WHERE provider = 'yahoo'
-                      AND provider_symbol IN ({placeholders})
-                    """,
-                    tuple(symbols),
-                ).fetchall()
-            }
-            for holding in holdings:
-                known = known_names.get(holding.provider_symbol)
-                if (
-                    known
-                    and SequenceMatcher(
-                        None,
-                        known.casefold(),
-                        holding.name.casefold(),
-                    ).ratio()
-                    < 0.35
-                ):
-                    issues.append(
-                        f"{holding.provider_symbol} changed identity from "
-                        f"{known!r} to {holding.name!r}"
-                    )
+    def _instrument_identity_issues(self, holdings: Sequence[Holding]) -> list[str]:
+        symbols = {holding.provider_symbol for holding in holdings}
+        if not symbols:
+            return []
+        placeholders = ",".join("?" for _ in symbols)
+        known_names = {
+            row["provider_symbol"]: row["name"]
+            for row in self.connection.execute(
+                f"""
+                SELECT provider_symbol, name FROM instruments
+                WHERE provider = 'yahoo'
+                  AND provider_symbol IN ({placeholders})
+                """,
+                tuple(symbols),
+            ).fetchall()
+        }
+        return [
+            f"{holding.provider_symbol} changed identity from "
+            f"{known_names[holding.provider_symbol]!r} to {holding.name!r}"
+            for holding in holdings
+            if holding.provider_symbol in known_names
+            and SequenceMatcher(
+                None,
+                known_names[holding.provider_symbol].casefold(),
+                holding.name.casefold(),
+            ).ratio()
+            < 0.35
+        ]
 
-        weights = [holding.weight for holding in holdings if holding.weight is not None]
-        if len(weights) >= len(holdings) * 0.9:
-            total_weight = sum(weights)
-            if not 0.97 <= total_weight <= 1.03:
-                issues.append(
-                    f"portfolio weights sum to {total_weight:.2%}, not about 100%"
-                )
-
-        latest = self.connection.execute(
+    def _latest_snapshot(self, universe_code: str) -> sqlite3.Row | None:
+        return self.connection.execute(
             """
             SELECT s.id, s.as_of_date
             FROM universe_snapshots s
@@ -425,14 +511,9 @@ class Database:
             """,
             (universe_code,),
         ).fetchone()
-        if latest is None:
-            return issues
-        latest_date = date.fromisoformat(latest["as_of_date"])
-        if holdings_file.as_of_date < latest_date:
-            issues.append(
-                f"holdings date {holdings_file.as_of_date} predates latest snapshot {latest_date}"
-            )
-        previous_symbols = {
+
+    def _snapshot_provider_symbols(self, snapshot_id: int) -> set[str]:
+        return {
             row["provider_symbol"]
             for row in self.connection.execute(
                 """
@@ -441,16 +522,9 @@ class Database:
                 JOIN instruments i ON i.id = h.instrument_id
                 WHERE h.snapshot_id = ?
                 """,
-                (latest["id"],),
+                (snapshot_id,),
             ).fetchall()
         }
-        changed = len(symbols.symmetric_difference(previous_symbols))
-        denominator = max(len(symbols), len(previous_symbols), 1)
-        if changed / denominator > 0.25:
-            issues.append(
-                f"composition changes {changed}/{denominator} symbols versus latest snapshot"
-            )
-        return issues
 
     def import_snapshot(
         self,
@@ -458,7 +532,6 @@ class Database:
         *,
         universe_code: str,
         universe_name: str,
-        benchmark_symbol: str | None = None,
     ) -> Snapshot:
         if holdings_file.as_of_date > datetime.now(SYDNEY).date():
             raise ValueError(
@@ -521,38 +594,6 @@ class Database:
                 """,
                 (universe_id, holdings_file.sha256),
             ).fetchone()["id"]
-
-            qualified_benchmark = (benchmark_symbol or universe_code).strip().upper()
-            if "." not in qualified_benchmark:
-                qualified_benchmark = f"{qualified_benchmark}.AX"
-            local_benchmark = qualified_benchmark.removesuffix(".AX")
-            connection.execute(
-                """
-                INSERT INTO instruments
-                    (exchange, local_symbol, provider, provider_symbol, name)
-                VALUES ('ASX', ?, 'yahoo', ?, ?)
-                ON CONFLICT (provider, provider_symbol) DO UPDATE SET
-                    local_symbol = excluded.local_symbol,
-                    name = excluded.name
-                """,
-                (local_benchmark, qualified_benchmark, universe_name),
-            )
-            benchmark_id = connection.execute(
-                """
-                SELECT id FROM instruments
-                WHERE provider = 'yahoo' AND provider_symbol = ?
-                """,
-                (qualified_benchmark,),
-            ).fetchone()["id"]
-            connection.execute(
-                """
-                INSERT INTO universe_series (universe_id, instrument_id, role)
-                VALUES (?, ?, 'benchmark')
-                ON CONFLICT (universe_id, role) DO UPDATE SET
-                    instrument_id = excluded.instrument_id
-                """,
-                (universe_id, benchmark_id),
-            )
 
             for holding in holdings_file.holdings:
                 connection.execute(
@@ -671,31 +712,12 @@ class Database:
             """,
             (snapshot_id,),
         ).fetchall()
-        benchmark_row = self.connection.execute(
-            """
-            SELECT i.id, i.local_symbol, i.provider_symbol, i.name
-            FROM universe_series us
-            JOIN instruments i ON i.id = us.instrument_id
-            WHERE us.universe_id = ? AND us.role = 'benchmark'
-            """,
-            (row["universe_id"],),
-        ).fetchone()
-        benchmark = (
-            SnapshotInstrument(
-                instrument_id=benchmark_row["id"],
-                local_symbol=benchmark_row["local_symbol"],
-                provider_symbol=benchmark_row["provider_symbol"],
-                name=benchmark_row["name"],
-            )
-            if benchmark_row is not None
-            else None
-        )
-        auxiliary_rows = self.connection.execute(
+        series_rows = self.connection.execute(
             """
             SELECT us.role, i.id, i.local_symbol, i.provider_symbol, i.name
             FROM universe_series us
             JOIN instruments i ON i.id = us.instrument_id
-            WHERE us.universe_id = ? AND us.role <> 'benchmark'
+            WHERE us.universe_id = ?
             ORDER BY us.role
             """,
             (row["universe_id"],),
@@ -715,8 +737,7 @@ class Database:
                 )
                 for item in instruments
             ),
-            benchmark=benchmark,
-            auxiliary_series=tuple(
+            market_series=tuple(
                 SnapshotSeries(
                     role=item["role"],
                     instrument=SnapshotInstrument(
@@ -726,7 +747,7 @@ class Database:
                         name=item["name"],
                     ),
                 )
-                for item in auxiliary_rows
+                for item in series_rows
             ),
         )
 
@@ -883,40 +904,6 @@ class Database:
             )
         )
 
-    def satisfy_sync_requirements(
-        self,
-        instrument_id: int,
-        *,
-        checked_through: date,
-        history_checked_from: date | None = None,
-    ) -> None:
-        """Close obligations covered by both date boundaries.
-
-        ``history_checked_from=None`` retains the old repository helper's
-        forward-only behaviour for callers outside the synchroniser. Production
-        sync uses :meth:`satisfy_ready_sync_requirements`.
-        """
-        history_clause = ""
-        parameters: tuple[object, ...] = (
-            utc_now(),
-            instrument_id,
-            checked_through.isoformat(),
-        )
-        if history_checked_from is not None:
-            history_clause = " AND history_start IS NOT NULL AND history_start >= ?"
-            parameters += (history_checked_from.isoformat(),)
-        self.connection.execute(
-            f"""
-            UPDATE sync_requirements
-            SET status = 'satisfied', satisfied_at = ?
-            WHERE instrument_id = ? AND status = 'pending'
-              AND required_end < ?
-              {history_clause}
-            """,
-            parameters,
-        )
-        self.connection.commit()
-
     def prepare_sync_requirements(
         self,
         instrument_id: int,
@@ -924,7 +911,9 @@ class Database:
         calendar_days: int,
     ) -> date | None:
         """Persist and return the oldest history boundary for pending removals."""
-        modifier = f"-{max(calendar_days, 1)} days"
+        if calendar_days < 1:
+            raise ValueError("calendar_days must be positive")
+        modifier = f"-{calendar_days} days"
         self.connection.execute(
             """
             UPDATE sync_requirements
@@ -1032,12 +1021,17 @@ class Database:
             for row in sorted(rows, key=lambda row: row["provider_symbol"])
         )
 
-    def sync_states(self, instrument_ids: Sequence[int]) -> dict[int, sqlite3.Row]:
+    def instrument_sync_states(
+        self, instrument_ids: Sequence[int]
+    ) -> dict[int, sqlite3.Row]:
         if not instrument_ids:
             return {}
         placeholders = ",".join("?" for _ in instrument_ids)
         rows = self.connection.execute(
-            f"SELECT * FROM sync_state WHERE instrument_id IN ({placeholders})",
+            f"""
+            SELECT * FROM instrument_sync_state
+            WHERE instrument_id IN ({placeholders})
+            """,
             tuple(instrument_ids),
         ).fetchall()
         return {row["instrument_id"]: row for row in rows}
@@ -1348,55 +1342,12 @@ class Database:
     ) -> int:
         """Append observations and reconcile canonical factors from overlaps."""
         now = utc_now()
-        observations: list[tuple[Any, ...]] = []
-        factors: list[tuple[Any, ...]] = []
-        ordered = frame.sort_index()
-        previous: pd.Series | None = None
-        previous_date: str | None = None
-        for timestamp, row in ordered.iterrows():
-            trade_date = pd.Timestamp(timestamp).date().isoformat()
-            observations.append(
-                (
-                    run_id,
-                    instrument_id,
-                    trade_date,
-                    _finite(row.get("open")),
-                    _finite(row.get("high")),
-                    _finite(row.get("low")),
-                    _finite(row.get("close")),
-                    _finite(row.get("adjusted_close")),
-                    _finite(row.get("volume")),
-                    _finite(row.get("dividend")) or 0.0,
-                    _finite(row.get("split_ratio")) or 0.0,
-                    int(bool(row.get("repaired", False))),
-                    now,
-                )
-            )
-            previous_close = (
-                _finite(previous.get("close")) if previous is not None else None
-            )
-            previous_adjusted = (
-                _finite(previous.get("adjusted_close"))
-                if previous is not None
-                else None
-            )
-            factors.append(
-                (
-                    instrument_id,
-                    trade_date,
-                    previous_date,
-                    _ratio(row.get("open"), previous_close),
-                    _ratio(row.get("high"), previous_close),
-                    _ratio(row.get("low"), previous_close),
-                    _ratio(row.get("close"), previous_close),
-                    _ratio(row.get("adjusted_close"), previous_adjusted),
-                    _finite(row.get("volume")),
-                    run_id,
-                    now,
-                )
-            )
-            previous = row
-            previous_date = trade_date
+        observations, candidates = _series_rows(
+            frame,
+            run_id=run_id,
+            instrument_id=instrument_id,
+            observed_at=now,
+        )
 
         with self.transaction() as connection:
             connection.executemany(
@@ -1412,7 +1363,7 @@ class Database:
             existing = self._factor_rows(
                 connection,
                 instrument_id,
-                [factor[1] for factor in factors],
+                [candidate.trade_date for candidate in candidates],
             )
             cached_dates = {
                 row["trade_date"]
@@ -1424,148 +1375,24 @@ class Database:
                     (instrument_id,),
                 ).fetchall()
             }
-            candidate_dates = {factor[1] for factor in factors}
-            timeline = sorted(cached_dates | candidate_dates)
-            timeline_positions = {
-                trade_date: position for position, trade_date in enumerate(timeline)
-            }
-            chronological_previous = {
-                trade_date: timeline[position - 1] if position else None
-                for position, trade_date in enumerate(timeline)
-            }
-            invalid_candidates = {
-                factor[1]
-                for factor in factors
-                if factor[2] != chronological_previous[factor[1]]
-            }
-            candidate_by_date = {factor[1]: factor for factor in factors}
-            # A leading response row has no pair. If it is not already a
-            # cached anchor, rows derived from it cannot be committed with a
-            # dangling previous_trade_date. Cascade that rejection until a
-            # real cached anchor is reached.
-            changed = True
-            while changed:
-                changed = False
-                for factor in factors:
-                    predecessor = factor[2]
-                    if (
-                        predecessor in invalid_candidates
-                        and predecessor not in cached_dates
-                        and factor[1] not in invalid_candidates
-                    ):
-                        invalid_candidates.add(factor[1])
-                        changed = True
-            # Inserting an interior date is safe only when the same response
-            # also supplies its successor factor. Otherwise the stored
-            # successor would still point around the new row.
-            mutation_dates = set(candidate_dates - cached_dates)
-            for trade_date in candidate_dates & cached_dates:
-                current = existing.get(trade_date)
-                candidate = candidate_by_date[trade_date]
-                if (
-                    current is not None
-                    and current["total_return_factor"] is not None
-                    and candidate[7] is not None
-                    and _factor_changed(current, candidate)
-                ):
-                    mutation_dates.add(trade_date)
-            for trade_date in mutation_dates:
-                position = timeline_positions[trade_date]
-                successor = (
-                    timeline[position + 1] if position + 1 < len(timeline) else None
-                )
-                if successor in cached_dates and successor not in candidate_dates:
-                    invalid_candidates.add(trade_date)
-            # If the supplied successor is itself unusable, changing its
-            # predecessor would still leave a half-repaired chain.
-            changed = True
-            while changed:
-                changed = False
-                for trade_date in mutation_dates - invalid_candidates:
-                    position = timeline_positions[trade_date]
-                    successor = (
-                        timeline[position + 1] if position + 1 < len(timeline) else None
-                    )
-                    if successor in invalid_candidates:
-                        invalid_candidates.add(trade_date)
-                        changed = True
+            invalid_candidates = _invalid_factor_dates(
+                candidates,
+                existing=existing,
+                cached_dates=cached_dates,
+            )
             mutations = 0
-            for factor in factors:
-                if factor[1] in invalid_candidates:
+            for candidate in candidates:
+                if candidate.trade_date in invalid_candidates:
                     continue
-                current = existing.get(factor[1])
-                if current is None:
-                    connection.execute(
-                        """
-                        INSERT INTO daily_factors
-                            (instrument_id, trade_date, previous_trade_date,
-                             open_to_previous_close, high_to_previous_close,
-                             low_to_previous_close, close_to_previous_close,
-                             total_return_factor, volume, source_run_id, created_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        factor,
+                mutations += int(
+                    _persist_factor_candidate(
+                        connection,
+                        candidate,
+                        current=existing.get(candidate.trade_date),
+                        run_id=run_id,
+                        revised_at=now,
                     )
-                    mutations += 1
-                    continue
-                # The first row of a provider response has no predecessor. It
-                # must never erase an established factor. All later overlap
-                # rows are internally consistent pairs and can safely repair a
-                # null seam, inserted interior date, or genuine provider fix.
-                if factor[7] is None or not _factor_changed(current, factor):
-                    continue
-                connection.execute(
-                    """
-                    INSERT INTO factor_revisions
-                        (instrument_id, trade_date, previous_trade_date,
-                         open_to_previous_close, high_to_previous_close,
-                         low_to_previous_close, close_to_previous_close,
-                         total_return_factor, volume, source_run_id,
-                         replaced_by_run_id, reason, revised_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        instrument_id,
-                        current["trade_date"],
-                        current["previous_trade_date"],
-                        current["open_to_previous_close"],
-                        current["high_to_previous_close"],
-                        current["low_to_previous_close"],
-                        current["close_to_previous_close"],
-                        current["total_return_factor"],
-                        current["volume"],
-                        current["source_run_id"],
-                        run_id,
-                        "null seam"
-                        if current["total_return_factor"] is None
-                        else "overlap correction",
-                        now,
-                    ),
                 )
-                connection.execute(
-                    """
-                    UPDATE daily_factors SET
-                        previous_trade_date = ?, open_to_previous_close = ?,
-                        high_to_previous_close = ?, low_to_previous_close = ?,
-                        close_to_previous_close = ?, total_return_factor = ?,
-                        volume = ?, source_run_id = ?, created_at = ?
-                    WHERE instrument_id = ? AND trade_date = ?
-                    """,
-                    (
-                        factor[2],
-                        factor[3],
-                        factor[4],
-                        factor[5],
-                        factor[6],
-                        factor[7],
-                        factor[8],
-                        factor[9],
-                        factor[10],
-                        factor[0],
-                        factor[1],
-                    ),
-                )
-                mutations += 1
         return mutations
 
     def _factor_rows(
@@ -1607,28 +1434,21 @@ class Database:
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO sync_state
-                    (instrument_id, provider, backfill_attempted, checked_through,
-                     latest_trade_date, consecutive_failures, retry_after,
-                     last_error, updated_at)
-                VALUES (?, 'yahoo', ?, ?, ?, 0, NULL, NULL, ?)
+                INSERT INTO instrument_sync_state
+                    (instrument_id, provider, backfill_attempted,
+                     latest_trade_date, updated_at)
+                VALUES (?, 'yahoo', ?, ?, ?)
                 ON CONFLICT (instrument_id) DO UPDATE SET
-                    backfill_attempted = MAX(sync_state.backfill_attempted,
-                                             excluded.backfill_attempted),
-                    checked_through = CASE
-                        WHEN excluded.checked_through IS NULL
-                            THEN sync_state.checked_through
-                        WHEN sync_state.checked_through IS NULL
-                            THEN excluded.checked_through
-                        ELSE MAX(sync_state.checked_through,
-                                 excluded.checked_through)
-                    END,
+                    backfill_attempted = MAX(
+                        instrument_sync_state.backfill_attempted,
+                        excluded.backfill_attempted
+                    ),
                     latest_trade_date = CASE
                         WHEN excluded.latest_trade_date IS NULL
-                            THEN sync_state.latest_trade_date
-                        WHEN sync_state.latest_trade_date IS NULL
+                            THEN instrument_sync_state.latest_trade_date
+                        WHEN instrument_sync_state.latest_trade_date IS NULL
                             THEN excluded.latest_trade_date
-                        ELSE MAX(sync_state.latest_trade_date,
+                        ELSE MAX(instrument_sync_state.latest_trade_date,
                                  excluded.latest_trade_date)
                     END,
                     updated_at = excluded.updated_at
@@ -1636,7 +1456,6 @@ class Database:
                 (
                     instrument_id,
                     int(backfill_attempted),
-                    forward_checked,
                     latest_trade_date.isoformat() if latest_trade_date else None,
                     now,
                 ),
@@ -1663,7 +1482,6 @@ class Database:
                 """,
                 (instrument_id, obligation_type, forward_checked, now),
             )
-            self._refresh_legacy_sync_status(connection, instrument_id, now)
 
     def update_sync_failure(
         self,
@@ -1684,24 +1502,18 @@ class Database:
         with self.transaction() as connection:
             connection.execute(
                 """
-                INSERT INTO sync_state
-                    (instrument_id, provider, backfill_attempted, checked_through,
-                     consecutive_failures, retry_after, last_error, updated_at)
-                VALUES (?, 'yahoo', ?, ?, 0, NULL, NULL, ?)
+                INSERT INTO instrument_sync_state
+                    (instrument_id, provider, backfill_attempted,
+                     latest_trade_date, updated_at)
+                VALUES (?, 'yahoo', ?, NULL, ?)
                 ON CONFLICT (instrument_id) DO UPDATE SET
-                    backfill_attempted = MAX(sync_state.backfill_attempted,
-                                             excluded.backfill_attempted),
-                    checked_through = CASE
-                        WHEN excluded.checked_through IS NULL
-                            THEN sync_state.checked_through
-                        WHEN sync_state.checked_through IS NULL
-                            THEN excluded.checked_through
-                        ELSE MAX(sync_state.checked_through,
-                                 excluded.checked_through)
-                    END,
+                    backfill_attempted = MAX(
+                        instrument_sync_state.backfill_attempted,
+                        excluded.backfill_attempted
+                    ),
                     updated_at = excluded.updated_at
                 """,
-                (instrument_id, int(backfill_attempted), forward_checked, now),
+                (instrument_id, int(backfill_attempted), now),
             )
             connection.execute(
                 """
@@ -1733,57 +1545,6 @@ class Database:
                     now,
                 ),
             )
-            self._refresh_legacy_sync_status(connection, instrument_id, now)
-
-    @staticmethod
-    def _refresh_legacy_sync_status(
-        connection: sqlite3.Connection,
-        instrument_id: int,
-        now: str,
-    ) -> None:
-        outstanding = connection.execute(
-            """
-            SELECT consecutive_failures, retry_after, last_error
-            FROM sync_obligation_state
-            WHERE instrument_id = ? AND consecutive_failures > 0
-            ORDER BY updated_at DESC, obligation_type
-            """,
-            (instrument_id,),
-        ).fetchall()
-        failures = max(
-            (int(row["consecutive_failures"]) for row in outstanding),
-            default=0,
-        )
-        retry_after = max(
-            (row["retry_after"] for row in outstanding if row["retry_after"]),
-            default=None,
-        )
-        last_error = outstanding[0]["last_error"] if outstanding else None
-        connection.execute(
-            """
-            UPDATE sync_state SET consecutive_failures = ?, retry_after = ?,
-                                  last_error = ?, updated_at = ?
-            WHERE instrument_id = ?
-            """,
-            (failures, retry_after, last_error, now, instrument_id),
-        )
-
-    def factors_for_snapshot(self, snapshot_id: int) -> pd.DataFrame:
-        return pd.read_sql_query(
-            """
-            SELECT f.instrument_id, f.trade_date, f.previous_trade_date,
-                   f.open_to_previous_close, f.high_to_previous_close,
-                   f.low_to_previous_close, f.close_to_previous_close,
-                   f.total_return_factor, f.volume, i.provider_symbol
-            FROM daily_factors f
-            JOIN snapshot_holdings h ON h.instrument_id = f.instrument_id
-            JOIN instruments i ON i.id = f.instrument_id
-            WHERE h.snapshot_id = ?
-            ORDER BY f.trade_date, f.instrument_id
-            """,
-            self.connection,
-            params=(snapshot_id,),
-        )
 
     def factors_for_membership(self, membership: pd.DataFrame) -> pd.DataFrame:
         if membership.empty:
@@ -1869,15 +1630,20 @@ class Database:
             SELECT COUNT(*) AS holdings,
                    SUM(CASE WHEN hw.checked_from IS NOT NULL THEN 1 ELSE 0 END)
                        AS with_history,
-                   SUM(CASE WHEN s.last_error IS NOT NULL THEN 1 ELSE 0 END)
-                       AS provider_failures
+                   (
+                       SELECT COUNT(DISTINCT failed.instrument_id)
+                       FROM snapshot_holdings failed
+                       JOIN sync_obligation_state o
+                         ON o.instrument_id = failed.instrument_id
+                       WHERE failed.snapshot_id = ?
+                         AND o.last_error IS NOT NULL
+                   ) AS provider_failures
             FROM snapshot_holdings h
-            LEFT JOIN sync_state s ON s.instrument_id = h.instrument_id
             LEFT JOIN history_watermarks hw
               ON hw.instrument_id = h.instrument_id
             WHERE h.snapshot_id = ?
             """,
-            (snapshot_id,),
+            (snapshot_id, snapshot_id),
         ).fetchone()
         unavailable = self.connection.execute(
             """
@@ -1909,6 +1675,248 @@ class Database:
         return result
 
 
+def _holdings_file_issues(
+    holdings_file: HoldingsFile,
+    *,
+    universe_code: str,
+    today: date,
+) -> list[str]:
+    issues: list[str] = []
+    holdings = holdings_file.holdings
+    symbols = {holding.provider_symbol for holding in holdings}
+    if holdings_file.as_of_date > today:
+        issues.append(f"holdings date {holdings_file.as_of_date} is in the future")
+    minimum_count = 200 if universe_code == "VAS" else 2
+    if len(symbols) < minimum_count:
+        issues.append(
+            f"only {len(symbols)} distinct holdings; expected at least {minimum_count}"
+        )
+    if len(symbols) != len(holdings):
+        issues.append("multiple workbook rows map to the same provider symbol")
+
+    weights = [holding.weight for holding in holdings if holding.weight is not None]
+    if len(weights) >= len(holdings) * 0.9:
+        total_weight = sum(weights)
+        if not 0.97 <= total_weight <= 1.03:
+            issues.append(
+                f"portfolio weights sum to {total_weight:.2%}, not about 100%"
+            )
+    return issues
+
+
+def _snapshot_transition_issues(
+    *,
+    holdings_date: date,
+    latest_date: date,
+    symbols: set[str],
+    previous_symbols: set[str],
+) -> list[str]:
+    issues: list[str] = []
+    if holdings_date < latest_date:
+        issues.append(
+            f"holdings date {holdings_date} predates latest snapshot {latest_date}"
+        )
+    changed = len(symbols.symmetric_difference(previous_symbols))
+    denominator = max(len(symbols), len(previous_symbols), 1)
+    if changed / denominator > 0.25:
+        issues.append(
+            f"composition changes {changed}/{denominator} symbols versus latest snapshot"
+        )
+    return issues
+
+
+def _series_rows(
+    frame: pd.DataFrame,
+    *,
+    run_id: int,
+    instrument_id: int,
+    observed_at: str,
+) -> tuple[list[tuple[object, ...]], list[_FactorCandidate]]:
+    observations: list[tuple[object, ...]] = []
+    candidates: list[_FactorCandidate] = []
+    previous: pd.Series | None = None
+    previous_date: str | None = None
+    for timestamp, row in frame.sort_index().iterrows():
+        trade_date = pd.Timestamp(timestamp).date().isoformat()
+        observations.append(
+            (
+                run_id,
+                instrument_id,
+                trade_date,
+                _finite(row.get("open")),
+                _finite(row.get("high")),
+                _finite(row.get("low")),
+                _finite(row.get("close")),
+                _finite(row.get("adjusted_close")),
+                _finite(row.get("volume")),
+                _finite(row.get("dividend")) or 0.0,
+                _finite(row.get("split_ratio")) or 0.0,
+                int(bool(row.get("repaired", False))),
+                observed_at,
+            )
+        )
+        previous_close = (
+            _finite(previous.get("close")) if previous is not None else None
+        )
+        previous_adjusted = (
+            _finite(previous.get("adjusted_close")) if previous is not None else None
+        )
+        candidates.append(
+            _FactorCandidate(
+                instrument_id=instrument_id,
+                trade_date=trade_date,
+                previous_trade_date=previous_date,
+                open_to_previous_close=_ratio(row.get("open"), previous_close),
+                high_to_previous_close=_ratio(row.get("high"), previous_close),
+                low_to_previous_close=_ratio(row.get("low"), previous_close),
+                close_to_previous_close=_ratio(row.get("close"), previous_close),
+                total_return_factor=_ratio(
+                    row.get("adjusted_close"), previous_adjusted
+                ),
+                volume=_finite(row.get("volume")),
+                source_run_id=run_id,
+                created_at=observed_at,
+            )
+        )
+        previous = row
+        previous_date = trade_date
+    return observations, candidates
+
+
+def _invalid_factor_dates(
+    candidates: list[_FactorCandidate],
+    *,
+    existing: dict[str, sqlite3.Row],
+    cached_dates: set[str],
+) -> set[str]:
+    candidate_by_date = {candidate.trade_date: candidate for candidate in candidates}
+    candidate_dates = set(candidate_by_date)
+    timeline = sorted(cached_dates | candidate_dates)
+    predecessor = {
+        trade_date: timeline[position - 1] if position else None
+        for position, trade_date in enumerate(timeline)
+    }
+    successor = {
+        trade_date: timeline[position + 1] if position + 1 < len(timeline) else None
+        for position, trade_date in enumerate(timeline)
+    }
+    invalid = {
+        candidate.trade_date
+        for candidate in candidates
+        if candidate.previous_trade_date != predecessor[candidate.trade_date]
+    }
+
+    # A response can only introduce a chain segment that eventually joins an
+    # existing cached anchor. Reject every row downstream of a rejected,
+    # uncached predecessor.
+    while (
+        newly_invalid := {
+            candidate.trade_date
+            for candidate in candidates
+            if candidate.previous_trade_date in invalid
+            and candidate.previous_trade_date not in cached_dates
+        }
+        - invalid
+    ):
+        invalid.update(newly_invalid)
+
+    # Inserting or correcting an interior date also requires the response's
+    # successor row, otherwise the stored successor would still point around
+    # the mutation.
+    mutation_dates = candidate_dates - cached_dates
+    mutation_dates.update(
+        trade_date
+        for trade_date in candidate_dates & cached_dates
+        if existing[trade_date]["total_return_factor"] is not None
+        and candidate_by_date[trade_date].total_return_factor is not None
+        and _factor_changed(existing[trade_date], candidate_by_date[trade_date])
+    )
+    invalid.update(
+        trade_date
+        for trade_date in mutation_dates
+        if successor[trade_date] in cached_dates
+        and successor[trade_date] not in candidate_dates
+    )
+    while (
+        newly_invalid := {
+            trade_date
+            for trade_date in mutation_dates
+            if successor[trade_date] in invalid
+        }
+        - invalid
+    ):
+        invalid.update(newly_invalid)
+    return invalid
+
+
+def _persist_factor_candidate(
+    connection: sqlite3.Connection,
+    candidate: _FactorCandidate,
+    *,
+    current: sqlite3.Row | None,
+    run_id: int,
+    revised_at: str,
+) -> bool:
+    if current is None:
+        connection.execute(
+            """
+            INSERT INTO daily_factors
+                (instrument_id, trade_date, previous_trade_date,
+                 open_to_previous_close, high_to_previous_close,
+                 low_to_previous_close, close_to_previous_close,
+                 total_return_factor, volume, source_run_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            candidate.insert_parameters(),
+        )
+        return True
+
+    # A leading response row has no predecessor and must never erase an
+    # established factor. Later overlap rows are internally consistent pairs.
+    if candidate.total_return_factor is None or not _factor_changed(current, candidate):
+        return False
+    connection.execute(
+        """
+        INSERT INTO factor_revisions
+            (instrument_id, trade_date, previous_trade_date,
+             open_to_previous_close, high_to_previous_close,
+             low_to_previous_close, close_to_previous_close,
+             total_return_factor, volume, source_run_id,
+             replaced_by_run_id, reason, revised_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            candidate.instrument_id,
+            current["trade_date"],
+            current["previous_trade_date"],
+            current["open_to_previous_close"],
+            current["high_to_previous_close"],
+            current["low_to_previous_close"],
+            current["close_to_previous_close"],
+            current["total_return_factor"],
+            current["volume"],
+            current["source_run_id"],
+            run_id,
+            "null seam"
+            if current["total_return_factor"] is None
+            else "overlap correction",
+            revised_at,
+        ),
+    )
+    connection.execute(
+        """
+        UPDATE daily_factors SET
+            previous_trade_date = ?, open_to_previous_close = ?,
+            high_to_previous_close = ?, low_to_previous_close = ?,
+            close_to_previous_close = ?, total_return_factor = ?,
+            volume = ?, source_run_id = ?, created_at = ?
+        WHERE instrument_id = ? AND trade_date = ?
+        """,
+        candidate.update_parameters(),
+    )
+    return True
+
+
 def _finite(value: Any) -> float | None:
     if value is None or pd.isna(value):
         return None
@@ -1927,19 +1935,19 @@ def _ratio(value: Any, denominator: float | None) -> float | None:
     return numerator / denominator
 
 
-def _factor_changed(current: sqlite3.Row, candidate: tuple[Any, ...]) -> bool:
-    if current["previous_trade_date"] != candidate[2]:
+def _factor_changed(current: sqlite3.Row, candidate: _FactorCandidate) -> bool:
+    if current["previous_trade_date"] != candidate.previous_trade_date:
         return True
-    for column, position in (
-        ("open_to_previous_close", 3),
-        ("high_to_previous_close", 4),
-        ("low_to_previous_close", 5),
-        ("close_to_previous_close", 6),
-        ("total_return_factor", 7),
-        ("volume", 8),
+    for column in (
+        "open_to_previous_close",
+        "high_to_previous_close",
+        "low_to_previous_close",
+        "close_to_previous_close",
+        "total_return_factor",
+        "volume",
     ):
         old = current[column]
-        new = candidate[position]
+        new = getattr(candidate, column)
         if old is None or new is None:
             if old is not new:
                 return True

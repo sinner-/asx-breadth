@@ -27,7 +27,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from asx_breadth.db import Database  # noqa: E402
-from asx_breadth.dashboard import _relative_state  # noqa: E402
 from asx_breadth.holdings import parse_holdings  # noqa: E402
 from asx_breadth.indicators import (  # noqa: E402
     AdvanceDecline,
@@ -57,21 +56,19 @@ from asx_breadth.panels.charts import (  # noqa: E402
     _ema_regime_paths,
     _signed_rasi_paths,
 )
+from asx_breadth.panels.summary import relative_state  # noqa: E402
 from asx_breadth.providers.yahoo import YahooProvider, _normalise  # noqa: E402
 from asx_breadth.sync import synchronise  # noqa: E402
 
 
 class DashboardTests(unittest.TestCase):
-    def test_trend_state_names_each_ema_and_can_show_exact_levels(self) -> None:
+    def test_trend_state_names_each_ema(self) -> None:
         self.assertEqual(
-            _relative_state(108.92, 108.97, 108.68, include_values=True),
-            (
-                "Below EMA19 (108.97) · Above EMA39 (108.68)",
-                "neutral",
-            ),
+            relative_state(108.92, 108.97, 108.68),
+            ("Below EMA19 · Above EMA39", "neutral"),
         )
         self.assertEqual(
-            _relative_state(110.0, 108.97, 108.68),
+            relative_state(110.0, 108.97, 108.68),
             ("Above EMA19 · Above EMA39", "positive"),
         )
 
@@ -254,6 +251,56 @@ class HoldingsTests(unittest.TestCase):
             self.assertIsNone(parsed.holdings[0].market_value)
             self.assertIsNone(parsed.holdings[0].units)
 
+    def test_rejects_duplicate_holdings_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "holdings.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Example Fund"])
+            sheet.append(["As at 30 Jun 2026"])
+            sheet.append(
+                [
+                    "Ticker",
+                    "Holding Name",
+                    "Sector",
+                    "Country",
+                    "Portfolio weight",
+                    "Market value",
+                    "Units",
+                ]
+            )
+            row = ["AAA", "Example", "Banks", "AU", "1%", "$10", "1"]
+            sheet.append(row)
+            sheet.append(row)
+            workbook.save(path)
+
+            with self.assertRaisesRegex(ValueError, "duplicate ticker 'AAA'"):
+                parse_holdings(path)
+
+    def test_rejects_malformed_rows_inside_holdings_table(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "holdings.xlsx"
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.append(["Example Fund"])
+            sheet.append(["As at 30 Jun 2026"])
+            sheet.append(
+                [
+                    "Ticker",
+                    "Holding Name",
+                    "Sector",
+                    "Country",
+                    "Portfolio weight",
+                    "Market value",
+                    "Units",
+                ]
+            )
+            sheet.append(["AAA", "Example", "Banks", "AU", "not-a-number", "$10", "1"])
+            workbook.save(path)
+
+            with self.assertRaisesRegex(ValueError, "invalid portfolio weight"):
+                parse_holdings(path)
+
 
 class FactorCacheTests(unittest.TestCase):
     def test_schema_is_versioned_and_rejects_a_newer_cache(self) -> None:
@@ -262,7 +309,7 @@ class FactorCacheTests(unittest.TestCase):
             database = Database(path)
             self.assertEqual(
                 database.connection.execute("PRAGMA user_version").fetchone()[0],
-                2,
+                3,
             )
             database.close()
             connection = sqlite3.connect(path)
@@ -464,7 +511,7 @@ class FactorCacheTests(unittest.TestCase):
 
 
 class MembershipRepositoryTests(unittest.TestCase):
-    def test_auxiliary_series_is_registered_idempotently_and_synced(self) -> None:
+    def test_market_series_is_registered_idempotently_and_synced(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "cache.sqlite3")
             try:
@@ -472,7 +519,13 @@ class MembershipRepositoryTests(unittest.TestCase):
                     _holdings_file(date(2026, 7, 1), "first", ("AAA",)),
                     universe_code="VAS",
                     universe_name="VAS",
-                    benchmark_symbol="VAS.AX",
+                )
+                snapshot = database.register_universe_series(
+                    snapshot.snapshot_id,
+                    role="benchmark",
+                    provider_symbol="VAS.AX",
+                    local_symbol="VAS",
+                    name="VAS",
                 )
                 registered = database.register_universe_series(
                     snapshot.snapshot_id,
@@ -498,7 +551,7 @@ class MembershipRepositoryTests(unittest.TestCase):
                 }
                 self.assertIsNotNone(volatility)
                 self.assertEqual(volatility.provider_symbol, "^AXVI")
-                self.assertEqual(registered.auxiliary_series, repeated.auxiliary_series)
+                self.assertEqual(registered.market_series, repeated.market_series)
                 self.assertEqual(target_symbols, {"AAA.AX", "VAS.AX", "^AXVI"})
                 self.assertEqual(
                     [item.provider_symbol for item in repeated.all_instruments],
@@ -515,13 +568,18 @@ class MembershipRepositoryTests(unittest.TestCase):
                     _holdings_file(date(2026, 7, 1), "first", ("AAA", "BBB")),
                     universe_code="VAS",
                     universe_name="VAS",
-                    benchmark_symbol="VAS.AX",
+                )
+                first = database.register_universe_series(
+                    first.snapshot_id,
+                    role="benchmark",
+                    provider_symbol="VAS.AX",
+                    local_symbol="VAS",
+                    name="VAS",
                 )
                 second = database.import_snapshot(
                     _holdings_file(date(2026, 7, 8), "second", ("BBB", "CCC")),
                     universe_code="VAS",
                     universe_name="VAS",
-                    benchmark_symbol="VAS.AX",
                 )
 
                 membership = database.membership_for_snapshot(second.snapshot_id)
@@ -551,7 +609,6 @@ class MembershipRepositoryTests(unittest.TestCase):
                     _holdings_file(date(2026, 7, 15), "third", ("BBB", "CCC", "DDD")),
                     universe_code="VAS",
                     universe_name="VAS",
-                    benchmark_symbol="VAS.AX",
                 )
                 retry_symbols = {
                     target.instrument.provider_symbol
@@ -566,19 +623,32 @@ class MembershipRepositoryTests(unittest.TestCase):
                     for instrument in first.instruments
                     if instrument.local_symbol == "AAA"
                 )
-                database.satisfy_sync_requirements(
-                    aaa_id,
-                    checked_through=date(2026, 7, 8),
+                history_start = database.prepare_sync_requirements(
+                    aaa_id, calendar_days=1000
                 )
+                self.assertIsNotNone(history_start)
+                database.mark_history_checked(aaa_id, history_start)
+                database.update_sync_success(
+                    instrument_id=aaa_id,
+                    checked_through=date(2026, 7, 8),
+                    latest_trade_date=date(2026, 7, 7),
+                    backfill_attempted=False,
+                    obligation_type="forward",
+                )
+                database.satisfy_ready_sync_requirements(aaa_id)
                 still_pending = {
                     target.instrument.provider_symbol
                     for target in database.sync_targets_for_snapshot(third.snapshot_id)
                 }
                 self.assertIn("AAA.AX", still_pending)
-                database.satisfy_sync_requirements(
-                    aaa_id,
+                database.update_sync_success(
+                    instrument_id=aaa_id,
                     checked_through=date(2026, 7, 9),
+                    latest_trade_date=date(2026, 7, 8),
+                    backfill_attempted=False,
+                    obligation_type="forward",
                 )
+                database.satisfy_ready_sync_requirements(aaa_id)
                 cleared_symbols = {
                     target.instrument.provider_symbol
                     for target in database.sync_targets_for_snapshot(third.snapshot_id)
@@ -689,7 +759,7 @@ class IndicatorTests(unittest.TestCase):
             IndicatorContext(
                 self.snapshot,
                 factors,
-                benchmark_factors=pd.DataFrame({"trade_date": dates}),
+                series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
             ),
             {},
         )
@@ -738,7 +808,7 @@ class IndicatorTests(unittest.TestCase):
                 IndicatorContext(
                     snapshot,
                     factors,
-                    benchmark_factors=pd.DataFrame({"trade_date": dates}),
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
                 ),
                 {},
             )
@@ -771,7 +841,15 @@ class IndicatorTests(unittest.TestCase):
             ],
         )
         results = run_indicators(
-            IndicatorContext(self.snapshot, factors),
+            IndicatorContext(
+                self.snapshot,
+                factors,
+                series_factors={
+                    "benchmark": pd.DataFrame(
+                        {"trade_date": pd.date_range("2026-07-01", periods=4)}
+                    )
+                },
+            ),
             (AdvanceDecline(), RatioAdjustedMcClellan()),
         )
         ad = results["advance_decline"].frame
@@ -833,6 +911,7 @@ class IndicatorTests(unittest.TestCase):
                     snapshot=current,
                     factors=pd.DataFrame(rows),
                     membership=membership,
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
                 ),
                 {},
             )
@@ -863,7 +942,7 @@ class IndicatorTests(unittest.TestCase):
             IndicatorContext(
                 self.snapshot,
                 pd.DataFrame(rows),
-                benchmark_factors=pd.DataFrame({"trade_date": dates}),
+                series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
             ),
             {},
         )
@@ -904,7 +983,9 @@ class IndicatorTests(unittest.TestCase):
                         instruments=(SnapshotInstrument(1, "AAA", "AAA.AX", "AAA"),),
                     ),
                     factors=factors,
-                    benchmark_factors=pd.DataFrame({"trade_date": benchmark_dates}),
+                    series_factors={
+                        "benchmark": pd.DataFrame({"trade_date": benchmark_dates})
+                    },
                 ),
                 {},
             )
@@ -941,7 +1022,6 @@ class IndicatorTests(unittest.TestCase):
             tuple(figure.layout.xaxis.rangebreaks[0].bounds),
             ("sat", "mon"),
         )
-        self.assertEqual(figure.layout.hoverlabel.bgcolor, "#fffdf8")
         self.assertEqual(figure.layout.dragmode, "zoom")
 
     def test_rasi_crossing_uses_compressed_weekday_time(self) -> None:
@@ -964,7 +1044,6 @@ class IndicatorTests(unittest.TestCase):
             {
                 "axvi": [10.0, 14.0, 8.0],
                 "axvi_ema200": [12.0, 12.0, 12.0],
-                "above_ema200": [False, True, False],
             },
             index=pd.to_datetime(["2026-07-10", "2026-07-13", "2026-07-14"]),
         )
@@ -1016,6 +1095,7 @@ class IndicatorTests(unittest.TestCase):
                 "issues": [10],
                 "advances_plus_declines": [5],
                 "net_advances": [3],
+                "quality_ok": [True],
             },
             index=pd.to_datetime(["2026-07-01"]),
         )
@@ -1042,6 +1122,7 @@ class IndicatorTests(unittest.TestCase):
                 "declines": [1, 0],
                 "advances_plus_declines": [5, 0],
                 "net_advances": [3.0, float("nan")],
+                "quality_ok": [True, False],
             },
             index=pd.to_datetime(["2026-07-01", "2026-07-02"]),
         )
@@ -1066,12 +1147,16 @@ class IndicatorTests(unittest.TestCase):
                 "trade_date": pd.to_datetime(
                     ["2026-07-01", "2026-07-02", "2026-07-03"]
                 ),
+                "previous_trade_date": pd.to_datetime(
+                    [None, "2026-07-01", "2026-07-02"]
+                ),
                 "total_return_factor": [None, 1.12, 1.02],
                 "close_to_previous_close": [None, 1.10, 1.01],
                 "high_to_previous_close": [None, 1.15, 1.04],
                 "low_to_previous_close": [None, 1.05, 0.99],
             }
         )
+        benchmark = SnapshotInstrument(3, "VAS", "VAS.AX", "VAS")
         snapshot = Snapshot(
             snapshot_id=1,
             universe_code="VAS",
@@ -1079,7 +1164,7 @@ class IndicatorTests(unittest.TestCase):
             as_of_date=date(2026, 6, 30),
             source_path="holdings.xlsx",
             instruments=(),
-            benchmark=SnapshotInstrument(3, "VAS", "VAS.AX", "VAS"),
+            market_series=(SnapshotSeries("benchmark", benchmark),),
         )
         result = (
             BenchmarkTrend()
@@ -1087,8 +1172,8 @@ class IndicatorTests(unittest.TestCase):
                 IndicatorContext(
                     snapshot,
                     pd.DataFrame(),
-                    factors,
-                    benchmark_anchor_price=57.12,
+                    series_factors={"benchmark": factors},
+                    series_anchor_prices={"benchmark": 57.12},
                 ),
                 {},
             )
@@ -1125,7 +1210,7 @@ class IndicatorTests(unittest.TestCase):
             as_of_date=date(2026, 6, 30),
             source_path="holdings.xlsx",
             instruments=(),
-            auxiliary_series=(SnapshotSeries("volatility", volatility),),
+            market_series=(SnapshotSeries("volatility", volatility),),
         )
 
         result = VolatilityTrend().calculate(
@@ -1168,7 +1253,7 @@ class IndicatorTests(unittest.TestCase):
             as_of_date=date(2026, 6, 30),
             source_path="holdings.xlsx",
             instruments=(),
-            auxiliary_series=(SnapshotSeries("currency_index", currency_index),),
+            market_series=(SnapshotSeries("currency_index", currency_index),),
         )
 
         result = CurrencyIndexTrend().calculate(
@@ -1200,7 +1285,11 @@ class IndicatorTests(unittest.TestCase):
                     {
                         "instrument_id": instrument_id,
                         "trade_date": trade_date,
+                        "previous_trade_date": (
+                            dates[position - 1] if position else pd.NaT
+                        ),
                         "close_to_previous_close": factor if position else None,
+                        "total_return_factor": factor if position else None,
                         "high_to_previous_close": (
                             (1.10 if instrument_id == 1 else 1.00) if position else None
                         ),
@@ -1211,7 +1300,14 @@ class IndicatorTests(unittest.TestCase):
                 )
         frame = (
             NewHighLow(lookback_sessions=3)
-            .calculate(IndicatorContext(self.snapshot, pd.DataFrame(rows)), {})
+            .calculate(
+                IndicatorContext(
+                    self.snapshot,
+                    pd.DataFrame(rows),
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
+                ),
+                {},
+            )
             .frame
         )
         self.assertEqual(frame.index.min(), dates[3])
@@ -1230,7 +1326,11 @@ class IndicatorTests(unittest.TestCase):
                     {
                         "instrument_id": instrument_id,
                         "trade_date": trade_date,
+                        "previous_trade_date": (
+                            dates[position - 1] if position else pd.NaT
+                        ),
                         "close_to_previous_close": factor if position else None,
+                        "total_return_factor": factor if position else None,
                         "high_to_previous_close": (
                             (1.10 if instrument_id == 1 else 1.00) if position else None
                         ),
@@ -1262,6 +1362,7 @@ class IndicatorTests(unittest.TestCase):
                     snapshot=current,
                     factors=pd.DataFrame(rows),
                     membership=membership,
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
                 ),
                 {},
             )
@@ -1282,7 +1383,13 @@ class IndicatorTests(unittest.TestCase):
                 {
                     "instrument_id": 1,
                     "trade_date": trade_date,
+                    "previous_trade_date": (
+                        dates[position - 2]
+                        if position == 4
+                        else (dates[position - 1] if position else pd.NaT)
+                    ),
                     "close_to_previous_close": 1.10 if position else None,
+                    "total_return_factor": 1.10 if position else None,
                     "high_to_previous_close": 1.10 if position else None,
                     "low_to_previous_close": 1.00 if position else None,
                 }
@@ -1304,7 +1411,7 @@ class IndicatorTests(unittest.TestCase):
                 IndicatorContext(
                     snapshot=current,
                     factors=pd.DataFrame(rows),
-                    benchmark_factors=pd.DataFrame({"trade_date": dates}),
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
                 ),
                 {},
             )
@@ -1328,7 +1435,11 @@ class IndicatorTests(unittest.TestCase):
                     {
                         "instrument_id": instrument.instrument_id,
                         "trade_date": trade_date,
+                        "previous_trade_date": (
+                            dates[position - 1] if position else pd.NaT
+                        ),
                         "close_to_previous_close": 1.01 if position else None,
+                        "total_return_factor": 1.01 if position else None,
                         "high_to_previous_close": 1.01 if position else None,
                         "low_to_previous_close": 1.00 if position else None,
                     }
@@ -1347,7 +1458,7 @@ class IndicatorTests(unittest.TestCase):
                 IndicatorContext(
                     snapshot=snapshot,
                     factors=pd.DataFrame(rows),
-                    benchmark_factors=pd.DataFrame({"trade_date": dates}),
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
                 ),
                 {},
             )
@@ -1359,6 +1470,12 @@ class IndicatorTests(unittest.TestCase):
 
 
 class ProviderAndSyncTests(unittest.TestCase):
+    def test_sync_options_reject_invalid_limits(self) -> None:
+        with self.assertRaisesRegex(ValueError, "must be positive"):
+            SyncOptions(retries=0)
+        with self.assertRaisesRegex(ValueError, "must be non-negative"):
+            SyncOptions(batch_pause=-0.1)
+
     def test_missing_adjusted_close_is_rejected(self) -> None:
         raw = pd.DataFrame(
             {
@@ -1606,7 +1723,6 @@ class ProviderAndSyncTests(unittest.TestCase):
                     _holdings_file(date(2026, 7, 1), "first", ("AAA",)),
                     universe_code="TEST",
                     universe_name="TEST",
-                    benchmark_symbol=None,
                 )
                 provider = _FakeProvider(
                     _frame(

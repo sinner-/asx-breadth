@@ -6,6 +6,12 @@ import numpy as np
 import pandas as pd
 
 from .base import IndicatorContext, IndicatorResult
+from .series_level import (
+    links_previous,
+    ordered_factor_frame,
+    positive_number,
+    reconstruct_actual_level,
+)
 
 
 COLUMNS = [
@@ -29,38 +35,41 @@ class BenchmarkTrend:
         results: dict[str, IndicatorResult],
     ) -> IndicatorResult:
         del results
-        factors = context.benchmark_factors.copy()
+        instrument = context.snapshot.instrument_for_role("benchmark")
         symbol = (
-            context.snapshot.benchmark.provider_symbol
-            if context.snapshot.benchmark is not None
+            instrument.provider_symbol
+            if instrument is not None
             else context.snapshot.universe_code
         )
-        if factors.empty:
-            return IndicatorResult(
-                key=self.key,
-                title=f"{symbol} Total Return & Trend",
-                frame=pd.DataFrame(columns=COLUMNS),
-                metadata={"benchmark_symbol": symbol},
-            )
+        raw_factors = context.series_factors.get("benchmark", pd.DataFrame())
+        anchor_price = context.series_anchor_prices.get("benchmark")
+        required = {
+            "trade_date",
+            "previous_trade_date",
+            "total_return_factor",
+            "close_to_previous_close",
+            "high_to_previous_close",
+            "low_to_previous_close",
+        }
+        if raw_factors.empty or not required.issubset(raw_factors.columns):
+            return _empty_result(symbol)
 
-        factors["trade_date"] = pd.to_datetime(factors["trade_date"])
-        factors = factors.sort_values("trade_date").reset_index(drop=True)
-        total_levels = _total_return_levels(
-            factors,
-            anchor=context.benchmark_anchor_price,
-        )
+        factors = ordered_factor_frame(raw_factors)
+        total_levels = reconstruct_actual_level(factors, anchor_price).to_numpy()
+        if not len(total_levels):
+            return _empty_result(symbol)
         rows: list[dict[str, float | pd.Timestamp]] = []
         for position, row in enumerate(factors.itertuples(index=False)):
-            total_factor = _positive(row.total_return_factor)
-            close_factor = _positive(row.close_to_previous_close)
-            high_factor = _positive(row.high_to_previous_close)
-            low_factor = _positive(row.low_to_previous_close)
+            total_factor = positive_number(row.total_return_factor)
+            close_factor = positive_number(row.close_to_previous_close)
+            high_factor = positive_number(row.high_to_previous_close)
+            low_factor = positive_number(row.low_to_previous_close)
             total_index = total_levels[position]
             adjusted_high = np.nan
             adjusted_low = np.nan
             previous_total = (
                 total_levels[position - 1]
-                if position > 0 and _links_previous(factors, position)
+                if position > 0 and links_previous(factors, position)
                 else np.nan
             )
             if (
@@ -83,7 +92,6 @@ class BenchmarkTrend:
             )
 
         frame = pd.DataFrame(rows).set_index("trade_date")
-        anchor_price = context.benchmark_anchor_price
         frame["total_return_ema19"] = (
             frame["total_return_index"]
             .ewm(span=19, adjust=False, min_periods=19)
@@ -120,52 +128,10 @@ class BenchmarkTrend:
         )
 
 
-def _positive(value: object) -> float | None:
-    if value is None or pd.isna(value):
-        return None
-    number = float(value)
-    return number if np.isfinite(number) and number > 0 else None
-
-
-def _total_return_levels(factors: pd.DataFrame, *, anchor: object) -> np.ndarray:
-    """Reconstruct one honest factor-chain segment without bridging a bad row."""
-    levels = np.full(len(factors), np.nan, dtype=float)
-    if not len(factors):
-        return levels
-
-    anchor_value = _positive(anchor)
-    if anchor_value is not None:
-        # A real latest adjusted close identifies the scale of the newest
-        # connected segment. Work backwards until an explicit broken link; older
-        # values cannot be placed on that scale and remain unavailable.
-        levels[-1] = anchor_value
-        for position in range(len(factors) - 1, 0, -1):
-            factor = _positive(factors.iloc[position]["total_return_factor"])
-            if factor is None or not _links_previous(factors, position):
-                break
-            levels[position - 1] = levels[position] / factor
-        return levels
-
-    # Without a real price anchor, the initial row can supply an arbitrary base
-    # only for its original connected segment. Never silently rebase after a
-    # broken interior factor because that would make later values incomparable.
-    levels[0] = 100.0
-    for position in range(1, len(factors)):
-        factor = _positive(factors.iloc[position]["total_return_factor"])
-        if factor is None or not _links_previous(factors, position):
-            break
-        levels[position] = levels[position - 1] * factor
-    return levels
-
-
-def _links_previous(factors: pd.DataFrame, position: int) -> bool:
-    if position <= 0:
-        return False
-    if "previous_trade_date" not in factors:
-        return True
-    reported = factors.iloc[position]["previous_trade_date"]
-    if pd.isna(reported):
-        return False
-    return pd.Timestamp(reported) == pd.Timestamp(
-        factors.iloc[position - 1]["trade_date"]
+def _empty_result(symbol: str) -> IndicatorResult:
+    return IndicatorResult(
+        key=BenchmarkTrend.key,
+        title=f"{symbol} Total Return & Trend",
+        frame=pd.DataFrame(columns=COLUMNS),
+        metadata={"benchmark_symbol": symbol, "warmup_sessions": 200},
     )

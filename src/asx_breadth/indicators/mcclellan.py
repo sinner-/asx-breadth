@@ -35,7 +35,6 @@ class RatioAdjustedMcClellan:
                 title="McClellan Ratio-Adjusted Summation Index",
                 frame=pd.DataFrame(columns=columns),
                 metadata={
-                    "latest_input_quality_ok": None,
                     "latest_signal_updated": None,
                     "last_accepted_session": None,
                 },
@@ -60,11 +59,7 @@ class RatioAdjustedMcClellan:
             frame["ratio_ema19"] - frame["ratio_ema39"]
         ).where(available)
         frame["rasi"] = frame["mcclellan_oscillator"].fillna(0).cumsum()
-        input_quality = (
-            (ad["quality_ok"] if "quality_ok" in ad else ad["net_advances"].notna())
-            .fillna(False)
-            .astype(bool)
-        )
+        input_quality = ad["quality_ok"].fillna(False).astype(bool)
         frame["input_quality_ok"] = input_quality
         frame["signal_updated"] = input_quality & available
         accepted_sessions = pd.Series(pd.NaT, index=frame.index, dtype="datetime64[ns]")
@@ -83,7 +78,6 @@ class RatioAdjustedMcClellan:
                 "trend_seeds": 0,
                 "summation_seed": 0,
                 "warmup_sessions": 252,
-                "latest_input_quality_ok": bool(frame["input_quality_ok"].iloc[-1]),
                 "latest_signal_updated": bool(frame["signal_updated"].iloc[-1]),
                 "last_accepted_session": (
                     pd.Timestamp(last_accepted.iloc[-1]).date().isoformat()

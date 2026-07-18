@@ -39,7 +39,7 @@ from asx_breadth.sync import synchronise  # noqa: E402
 
 
 class MigrationAndAdmissionTests(unittest.TestCase):
-    def test_repairs_partially_upgraded_v2_and_migrates_forward_state(self) -> None:
+    def test_repairs_v2_cache_and_splits_legacy_sync_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cache.sqlite3"
             database = Database(path)
@@ -55,6 +55,21 @@ class MigrationAndAdmissionTests(unittest.TestCase):
             ).fetchone()["id"]
             database.connection.execute(
                 """
+                CREATE TABLE sync_state (
+                    instrument_id INTEGER PRIMARY KEY,
+                    provider TEXT NOT NULL,
+                    backfill_attempted INTEGER NOT NULL DEFAULT 0,
+                    checked_through TEXT,
+                    latest_trade_date TEXT,
+                    consecutive_failures INTEGER NOT NULL DEFAULT 0,
+                    retry_after TEXT,
+                    last_error TEXT,
+                    updated_at TEXT NOT NULL
+                )
+                """
+            )
+            database.connection.execute(
+                """
                 INSERT INTO sync_state
                     (instrument_id, provider, backfill_attempted, checked_through,
                      latest_trade_date, consecutive_failures, retry_after,
@@ -67,6 +82,10 @@ class MigrationAndAdmissionTests(unittest.TestCase):
             )
             database.connection.execute(
                 "DELETE FROM sync_obligation_state WHERE instrument_id = ?",
+                (instrument_id,),
+            )
+            database.connection.execute(
+                "DELETE FROM instrument_sync_state WHERE instrument_id = ?",
                 (instrument_id,),
             )
             database.connection.execute(
@@ -124,6 +143,18 @@ class MigrationAndAdmissionTests(unittest.TestCase):
                 self.assertIn("history_start", columns)
                 self.assertEqual(state["checked_through"], "2026-07-10")
                 self.assertEqual(state["consecutive_failures"], 2)
+                instrument_state = repaired.instrument_sync_states([instrument_id])[
+                    instrument_id
+                ]
+                self.assertEqual(instrument_state["latest_trade_date"], "2026-07-09")
+                self.assertEqual(instrument_state["backfill_attempted"], 1)
+                legacy_table = repaired.connection.execute(
+                    """
+                    SELECT 1 FROM sqlite_master
+                    WHERE type = 'table' AND name = 'sync_state'
+                    """
+                ).fetchone()
+                self.assertIsNone(legacy_table)
                 requirement = repaired.connection.execute(
                     "SELECT status FROM sync_requirements"
                 ).fetchone()["status"]
@@ -414,10 +445,10 @@ class ObligationTests(unittest.TestCase):
                 self.assertEqual(
                     states[(instrument_id, "forward")]["consecutive_failures"], 0
                 )
-                self.assertEqual(
-                    database.sync_states([instrument_id])[instrument_id]["last_error"],
-                    "history failed",
-                )
+                instrument_state = database.instrument_sync_states([instrument_id])[
+                    instrument_id
+                ]
+                self.assertNotIn("last_error", instrument_state.keys())
             finally:
                 database.close()
 

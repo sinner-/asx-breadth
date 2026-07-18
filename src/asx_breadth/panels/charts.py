@@ -11,12 +11,12 @@ from .base import PanelSummary
 from .summary import (
     band_state,
     constituent_share,
-    ema_detail,
     held_state,
     is_missing,
     last_accepted_session,
     latest_quality,
     latest_row,
+    level_state,
     number,
     positive,
     relative_state,
@@ -36,6 +36,65 @@ COLORS = {
 }
 
 
+def _add_line_trace(
+    figure: go.Figure,
+    frame: pd.DataFrame,
+    *,
+    column: str,
+    label: str,
+    colour: str,
+    width: float,
+    sparkline: bool = False,
+) -> None:
+    figure.add_trace(
+        go.Scatter(
+            x=frame.index,
+            y=frame[column],
+            name=label,
+            mode="lines",
+            line={"color": colour, "width": width},
+            hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
+            meta={"sparkline": True} if sparkline else None,
+        )
+    )
+
+
+def _add_three_ema_trend(
+    figure: go.Figure,
+    frame: pd.DataFrame,
+    *,
+    level_column: str,
+    level_label: str,
+    ema_prefix: str,
+) -> None:
+    _add_line_trace(
+        figure,
+        frame,
+        column=f"{ema_prefix}200",
+        label="200-session EMA",
+        colour="rgba(22, 33, 29, 0.55)",
+        width=1.4,
+    )
+    _add_line_trace(
+        figure,
+        frame,
+        column=level_column,
+        label=level_label,
+        colour=COLORS["ink"],
+        width=2.2,
+        sparkline=True,
+    )
+    for span, colour in ((19, COLORS["gold"]), (39, COLORS["blue"])):
+        _add_line_trace(
+            figure,
+            frame,
+            column=f"{ema_prefix}{span}",
+            label=f"{span}-session EMA",
+            colour=colour,
+            width=1.4,
+        )
+
+
 class BenchmarkTrendPanel:
     key = "benchmark-trend-chart"
     indicator_key = "benchmark_trend"
@@ -49,7 +108,6 @@ class BenchmarkTrendPanel:
             latest["total_return_index"],
             latest["total_return_ema19"],
             latest["total_return_ema39"],
-            include_values=True,
         )
         band_detail, _ = band_state(
             latest["total_return_index"], latest["low_ema200"], latest["high_ema200"]
@@ -91,16 +149,14 @@ class BenchmarkTrendPanel:
             ("total_return_ema19", "19-session EMA", COLORS["gold"], 1.4),
             ("total_return_ema39", "39-session EMA", COLORS["blue"], 1.4),
         ):
-            figure.add_trace(
-                go.Scatter(
-                    x=frame.index,
-                    y=frame[column],
-                    name=label,
-                    mode="lines",
-                    line={"color": colour, "width": width},
-                    hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
-                    meta={"sparkline": column == "total_return_index"},
-                )
+            _add_line_trace(
+                figure,
+                frame,
+                column=column,
+                label=label,
+                colour=colour,
+                width=width,
+                sparkline=column == "total_return_index",
             )
         return _style(figure, "Adjusted price (AUD)")
 
@@ -114,19 +170,12 @@ class GeometricIndexPanel:
         latest = latest_row(result)
         if latest is None:
             return PanelSummary("ASX 300 geometric", "—", "Unavailable")
-        _, tone = relative_state(
+        detail, tone = relative_state(
             latest["geometric_index"],
             latest["geometric_ema19"],
             latest["geometric_ema39"],
         )
-        detail = ema_detail(
-            latest,
-            (
-                ("geometric_ema19", "EMA19"),
-                ("geometric_ema39", "EMA39"),
-                ("geometric_ema200", "EMA200"),
-            ),
-        )
+        detail = f"{detail} · {level_state(latest['geometric_index'], latest['geometric_ema200'], 'EMA200')}"
         if latest_quality(result, latest) is False:
             detail = held_state(last_accepted_session(result))
             tone = "neutral"
@@ -141,41 +190,13 @@ class GeometricIndexPanel:
         frame = result.frame
         figure = go.Figure()
         figure.add_hline(y=100, line_width=1, line_color="rgba(22, 33, 29, 0.22)")
-        figure.add_trace(
-            go.Scatter(
-                x=frame.index,
-                y=frame["geometric_ema200"],
-                name="200-session EMA",
-                mode="lines",
-                line={"color": "rgba(22, 33, 29, 0.55)", "width": 1.4},
-                hovertemplate="<b>200-session EMA</b>: %{y:.2f}<extra></extra>",
-            )
+        _add_three_ema_trend(
+            figure,
+            frame,
+            level_column="geometric_index",
+            level_label="Geometric index",
+            ema_prefix="geometric_ema",
         )
-        figure.add_trace(
-            go.Scatter(
-                x=frame.index,
-                y=frame["geometric_index"],
-                name="Geometric index",
-                mode="lines",
-                line={"color": COLORS["ink"], "width": 2.2},
-                hovertemplate="<b>Geometric index</b>: %{y:.2f}<extra></extra>",
-                meta={"sparkline": True},
-            )
-        )
-        for column, label, colour in (
-            ("geometric_ema19", "19-session EMA", COLORS["gold"]),
-            ("geometric_ema39", "39-session EMA", COLORS["blue"]),
-        ):
-            figure.add_trace(
-                go.Scatter(
-                    x=frame.index,
-                    y=frame[column],
-                    name=label,
-                    mode="lines",
-                    line={"color": colour, "width": 1.4},
-                    hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
-                )
-            )
         return _style(figure, "Geometric total-return index (base 100)")
 
 
@@ -188,63 +209,29 @@ class CurrencyIndexTrendPanel:
         latest = latest_row(result)
         if latest is None:
             return PanelSummary("XDA", "—", "Unavailable")
-        _, tone = relative_state(
+        detail, tone = relative_state(
             latest["currency_index"],
             latest["currency_index_ema19"],
             latest["currency_index_ema39"],
         )
+        detail = f"{detail} · {level_state(latest['currency_index'], latest['currency_index_ema200'], 'EMA200')}"
         return PanelSummary(
             "XDA",
             number(latest["currency_index"], 2),
-            ema_detail(
-                latest,
-                (
-                    ("currency_index_ema19", "EMA19"),
-                    ("currency_index_ema39", "EMA39"),
-                    ("currency_index_ema200", "EMA200"),
-                ),
-            ),
+            detail,
             tone,
         )
 
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
         figure = go.Figure()
-        figure.add_trace(
-            go.Scatter(
-                x=frame.index,
-                y=frame["currency_index_ema200"],
-                name="200-session EMA",
-                mode="lines",
-                line={"color": "rgba(22, 33, 29, 0.55)", "width": 1.4},
-                hovertemplate="<b>200-session EMA</b>: %{y:.2f}<extra></extra>",
-            )
+        _add_three_ema_trend(
+            figure,
+            frame,
+            level_column="currency_index",
+            level_label="XDA",
+            ema_prefix="currency_index_ema",
         )
-        figure.add_trace(
-            go.Scatter(
-                x=frame.index,
-                y=frame["currency_index"],
-                name="XDA",
-                mode="lines",
-                line={"color": COLORS["ink"], "width": 2.2},
-                hovertemplate="<b>XDA</b>: %{y:.2f}<extra></extra>",
-                meta={"sparkline": True},
-            )
-        )
-        for column, label, colour in (
-            ("currency_index_ema19", "19-session EMA", COLORS["gold"]),
-            ("currency_index_ema39", "39-session EMA", COLORS["blue"]),
-        ):
-            figure.add_trace(
-                go.Scatter(
-                    x=frame.index,
-                    y=frame[column],
-                    name=label,
-                    mode="lines",
-                    line={"color": colour, "width": 1.4},
-                    hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
-                )
-            )
         return _style(figure, "Currency index level")
 
 
@@ -266,7 +253,7 @@ class VolatilityTrendPanel:
         return PanelSummary(
             "AXVI",
             number(latest["axvi"], 2),
-            f"EMA200 {number(ema, 2)}",
+            level_state(latest["axvi"], ema, "EMA200"),
             tone,
         )
 
@@ -353,7 +340,6 @@ class VolatilityTrendPanel:
                     "external_legend_color": (
                         "linear-gradient(90deg, #b84b45 0 50%, #111111 50% 100%)"
                     ),
-                    "external_hover_color": COLORS["ink"],
                     "sparkline_anchor": True,
                 },
             )
@@ -375,6 +361,7 @@ class AdvanceDeclinePanel:
             latest["cumulative_ad_ema19"],
             latest["cumulative_ad_ema39"],
         )
+        detail = f"{detail} · {level_state(latest['cumulative_ad'], latest['cumulative_ad_ema200'], 'EMA200')}"
         if latest_quality(result, latest) is False:
             detail = held_state(last_accepted_session(result))
             tone = "neutral"
@@ -400,16 +387,14 @@ class AdvanceDeclinePanel:
             ),
         )
         for column, label, colour, width in traces:
-            figure.add_trace(
-                go.Scatter(
-                    x=frame.index,
-                    y=frame[column],
-                    name=label,
-                    mode="lines",
-                    line={"color": colour, "width": width},
-                    hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
-                    meta={"sparkline": column == "cumulative_ad"},
-                )
+            _add_line_trace(
+                figure,
+                frame,
+                column=column,
+                label=label,
+                colour=colour,
+                width=width,
+                sparkline=column == "cumulative_ad",
             )
         return _style(figure, "Cumulative net issues")
 
@@ -473,7 +458,6 @@ class RasiPanel:
                     "external_legend_color": (
                         "linear-gradient(90deg, #147d64 0 50%, #b84b45 50% 100%)"
                     ),
-                    "external_hover_color": COLORS["ink"],
                     "sparkline_anchor": True,
                 },
             )
@@ -624,8 +608,8 @@ def _mcclellan_summary(
     value = latest[column]
     detail = signal_label(
         value,
-        positive_label="Positive impulse" if oscillator else "Above zero",
-        negative_label="Negative impulse" if oscillator else "Below zero",
+        positive_label="Breadth momentum positive" if oscillator else "Above zero",
+        negative_label="Breadth momentum negative" if oscillator else "Below zero",
     )
     tone = sign_tone(value)
     if latest_quality(result, latest) is False:
@@ -683,6 +667,13 @@ def _style(
     ]
     minimum_x = min(x_values) if x_values else None
     maximum_x = max(x_values) if x_values else None
+    display_bounds = None
+    if minimum_x is not None and maximum_x is not None and minimum_x < maximum_x:
+        display_maximum_x = pd.Timestamp(maximum_x) + pd.offsets.BDay(2)
+        display_bounds = [
+            pd.Timestamp(minimum_x).isoformat(),
+            display_maximum_x.isoformat(),
+        ]
     figure.update_layout(
         template="plotly_white",
         paper_bgcolor="rgba(0,0,0,0)",
@@ -694,21 +685,13 @@ def _style(
         height=445,
         margin={"l": 62, "r": 26, "t": 28, "b": 48},
         hovermode="x unified",
-        hoverlabel={
-            "bgcolor": "#fffdf8",
-            "bordercolor": "rgba(22, 33, 29, 0.28)",
-            "font": {"color": COLORS["ink"]},
-        },
         dragmode="zoom",
         showlegend=False,
-        legend={
-            "orientation": "h",
-            "y": 1.13,
-            "yanchor": "middle",
-            "x": 1,
-            "xanchor": "right",
+        meta={
+            "include_zero": include_zero,
+            "scale_group": scale_group,
+            "display_bounds": display_bounds,
         },
-        meta={"include_zero": include_zero, "scale_group": scale_group},
     )
     figure.update_xaxes(
         title=None,
@@ -720,13 +703,12 @@ def _style(
         rangebreaks=[{"bounds": ["sat", "mon"]}],
         rangeslider={"visible": False},
     )
-    if minimum_x is not None and maximum_x is not None and minimum_x < maximum_x:
+    if display_bounds is not None:
         # Leave one market-session gutter after the last observation. With the
         # final point placed exactly on the SVG clipping boundary, a late
         # crossover can be visually hidden even though its numeric coordinate
         # is correct (the latest VAS/EMA19 crossover exposed this).
-        display_maximum_x = pd.Timestamp(maximum_x) + pd.offsets.BDay(2)
-        figure.update_xaxes(range=[minimum_x, display_maximum_x])
+        figure.update_xaxes(range=display_bounds)
     # fixedrange is the explicit guarantee that wheel/box interactions cannot
     # zoom the value axis. Only the date axis remains interactive.
     figure.update_yaxes(
@@ -740,8 +722,7 @@ def _style(
 
 def display_frame(result: IndicatorResult) -> pd.DataFrame:
     """Return the observations a panel may honestly display."""
-    metadata = getattr(result, "metadata", {})
-    warmup = int(metadata.get("warmup_sessions", 0) or 0)
+    warmup = int(result.metadata.get("warmup_sessions", 0) or 0)
     return result.frame.iloc[warmup:] if warmup else result.frame
 
 

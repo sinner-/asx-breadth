@@ -13,6 +13,20 @@ from .membership import (
     market_sessions,
 )
 from .quality import QUALITY_POLICY, session_quality
+from .series_level import positive_number
+
+
+OUTPUT_COLUMNS = [
+    "new_highs",
+    "new_lows",
+    "nh_nl",
+    "eligible_issues",
+    "quoted_issues",
+    "active_issues",
+    "coverage",
+    "coverage_floor",
+    "quality_ok",
+]
 
 
 class NewHighLow:
@@ -24,6 +38,10 @@ class NewHighLow:
         lookback_sessions: int = 252,
         minimum_history_coverage: float = 0.90,
     ):
+        if lookback_sessions < 2:
+            raise ValueError("lookback_sessions must be at least 2")
+        if not 0 < minimum_history_coverage <= 1:
+            raise ValueError("minimum_history_coverage must be in (0, 1]")
         self.lookback_sessions = lookback_sessions
         self.minimum_history_coverage = minimum_history_coverage
 
@@ -33,23 +51,21 @@ class NewHighLow:
         results: dict[str, IndicatorResult],
     ) -> IndicatorResult:
         del results
-        columns = [
-            "new_highs",
-            "new_lows",
-            "nh_nl",
-            "eligible_issues",
-            "quoted_issues",
-            "active_issues",
-            "coverage",
-            "coverage_floor",
-            "quality_ok",
-        ]
         factors = context.factors.copy()
-        if factors.empty:
+        required = {
+            "instrument_id",
+            "trade_date",
+            "previous_trade_date",
+            "close_to_previous_close",
+            "total_return_factor",
+            "high_to_previous_close",
+            "low_to_previous_close",
+        }
+        if factors.empty or not required.issubset(factors.columns):
             return IndicatorResult(
                 key=self.key,
                 title="New 52-Week Highs and Lows",
-                frame=pd.DataFrame(columns=columns),
+                frame=pd.DataFrame(columns=OUTPUT_COLUMNS),
             )
 
         factors["trade_date"] = pd.to_datetime(factors["trade_date"])
@@ -67,11 +83,8 @@ class NewHighLow:
         lows = lows.reindex(sessions)
         highs.index.name = lows.index.name = "trade_date"
         highs.columns.name = lows.columns.name = "instrument_id"
-        prior_window = max(self.lookback_sessions - 1, 1)
-        required_observations = max(
-            1,
-            math.ceil(prior_window * self.minimum_history_coverage),
-        )
+        prior_window = self.lookback_sessions - 1
+        required_observations = math.ceil(prior_window * self.minimum_history_coverage)
         prior_high = (
             highs.shift(1)
             .rolling(window=prior_window, min_periods=required_observations)
@@ -136,7 +149,7 @@ class NewHighLow:
         return IndicatorResult(
             key=self.key,
             title="New 52-Week Highs and Lows",
-            frame=frame[columns],
+            frame=frame[OUTPUT_COLUMNS],
             metadata={
                 "lookback_sessions": self.lookback_sessions,
                 "minimum_history_coverage": self.minimum_history_coverage,
@@ -153,21 +166,15 @@ def _price_extremes(group: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     previous_total_return_index = 100.0
     previous_date: pd.Timestamp | None = None
     chain_available = True
-    has_previous_dates = "previous_trade_date" in group
     dates: list[pd.Timestamp] = []
     highs: list[float] = []
     lows: list[float] = []
     for position, row in enumerate(group.itertuples(index=False)):
         trade_date = pd.Timestamp(row.trade_date)
-        close_factor = _positive(row.close_to_previous_close)
-        # Production factor frames always contain total_return_factor. Falling
-        # back to close preserves the small synthetic plugin interface used by
-        # third-party indicators and older tests.
-        total_return_factor = _positive(
-            getattr(row, "total_return_factor", row.close_to_previous_close)
-        )
-        high_factor = _positive(row.high_to_previous_close)
-        low_factor = _positive(row.low_to_previous_close)
+        close_factor = positive_number(row.close_to_previous_close)
+        total_return_factor = positive_number(row.total_return_factor)
+        high_factor = positive_number(row.high_to_previous_close)
+        low_factor = positive_number(row.low_to_previous_close)
         dates.append(trade_date)
 
         if position == 0:
@@ -178,14 +185,12 @@ def _price_extremes(group: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
             previous_date = trade_date
             continue
 
-        links_previous = True
-        if has_previous_dates:
-            reported_previous = getattr(row, "previous_trade_date")
-            links_previous = (
-                pd.notna(reported_previous)
-                and previous_date is not None
-                and pd.Timestamp(reported_previous) == previous_date
-            )
+        reported_previous = row.previous_trade_date
+        links_previous = (
+            pd.notna(reported_previous)
+            and previous_date is not None
+            and pd.Timestamp(reported_previous) == previous_date
+        )
         if total_return_factor is None or not links_previous:
             chain_available = False
 
@@ -215,10 +220,3 @@ def _price_extremes(group: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         pd.Series(highs, index=dates, dtype=float),
         pd.Series(lows, index=dates, dtype=float),
     )
-
-
-def _positive(value: object) -> float | None:
-    if value is None or pd.isna(value):
-        return None
-    number = float(value)
-    return number if np.isfinite(number) and number > 0 else None

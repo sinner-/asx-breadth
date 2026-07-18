@@ -10,9 +10,7 @@ from .base import IndicatorContext
 
 def market_sessions(context: IndicatorContext) -> pd.DatetimeIndex:
     """Use the VAS benchmark as the canonical ASX session calendar."""
-    source = context.benchmark_factors
-    if source.empty or "trade_date" not in source:
-        source = context.factors
+    source = context.series_factors.get("benchmark", pd.DataFrame())
     if source.empty or "trade_date" not in source:
         return pd.DatetimeIndex([])
     return pd.DatetimeIndex(

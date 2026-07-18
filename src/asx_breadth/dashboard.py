@@ -16,10 +16,6 @@ from plotly.graph_objects import Figure
 from .indicators.base import IndicatorResult
 from .models import Snapshot
 from .panels.base import DashboardPanel, PanelSummary
-from .panels.summary import relative_state
-
-
-_relative_state = relative_state
 
 
 PLOT_CONFIG = {
@@ -212,12 +208,14 @@ def render_dashboard(
     .range-buttons button[aria-pressed="true"] {{ color:#fff; border-color:var(--green);
                                                    background:var(--green); }}
     .chart-pane {{ position:relative; min-height:520px; padding:0 10px 4px; overflow:hidden; }}
-    .chart-view {{ position:absolute; inset:0; width:100%; visibility:hidden;
-                   pointer-events:none; }}
-    .chart-view.is-active {{ position:relative; visibility:visible; pointer-events:auto; }}
+    .chart-view {{ display:none; }}
+    .chart-view.is-active {{ display:block; }}
     .hoverlayer .legend,.hoverlayer .hovertext {{ display:none !important; }}
     .js-plotly-plot .nsewdrag {{ cursor:default !important; }}
     .js-plotly-plot .nsewdrag:active {{ cursor:ew-resize !important; }}
+    .dragcover {{ cursor:ew-resize !important; }}
+    .js-plotly-plot .zoombox {{ fill:rgba(63,111,160,.20) !important;
+                               stroke:#3f6fa0 !important; stroke-width:1px !important; }}
     .chart-heading {{ display:flex; justify-content:space-between; gap:20px; align-items:baseline;
                       padding:20px 20px 0; }}
     .chart-heading h2 {{ margin:0; font-family:Georgia,"Times New Roman",serif;
@@ -231,7 +229,7 @@ def render_dashboard(
     .hover-readout {{ justify-content:flex-start; min-width:260px; color:var(--ink); }}
     .hover-date {{ color:var(--muted); font-weight:750; }}
     .legend-item {{ display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }}
-    .legend-value {{ color:var(--ink); font-variant-numeric:tabular-nums; }}
+    .legend-value {{ color:var(--ink); font-weight:750; font-variant-numeric:tabular-nums; }}
     .legend-swatch {{ width:17px; height:3px; border-radius:2px; background:var(--swatch); }}
     .empty {{ padding:42px; margin-top:18px; text-align:center; }}
     .unavailable {{ min-height:150px; }}
@@ -271,7 +269,7 @@ def render_dashboard(
       <p>{html.escape(snapshot.universe_name)} · holdings as at {snapshot.as_of_date:%d %b %Y}</p>
       <p>Generated {html.escape(generated)}<br>{html.escape(sync_text)}</p>
     </footer>
-    {_visible_y_script(plot_ids)}
+    {_interaction_script(plot_ids)}
   </main>
 </body>
 </html>
@@ -290,6 +288,46 @@ def _figure_has_data(figure: Figure) -> bool:
 
 
 def _sparkline_svg(figure: Figure, title: str) -> str:
+    anchor, series = _sparkline_traces(figure)
+    if anchor is None:
+        return _empty_sparkline(title)
+
+    anchor_points = [
+        (timestamp, value)
+        for timestamp, value in _sparkline_points(anchor)
+        if value is not None
+    ]
+    if not anchor_points:
+        return _empty_sparkline(title)
+    recent_anchor = anchor_points[-252:]
+    start = recent_anchor[0][0]
+    end = max(recent_anchor[-1][0], start + 1.0)
+
+    plotted = [
+        (trace, points)
+        for trace in series
+        if (points := _sparkline_points(trace, start=start, end=end))
+    ]
+    finite = [
+        value for _, points in plotted for _, value in points if value is not None
+    ]
+    if not finite:
+        return _empty_sparkline(title)
+
+    low, high = _sparkline_y_bounds(finite)
+    paths = "".join(
+        path
+        for trace, points in plotted
+        if (path := _sparkline_path(trace, points, start, end, low, high))
+    )
+    return (
+        '<svg class="sparkline" viewBox="0 0 240 42" preserveAspectRatio="none" '
+        f'role="img" aria-label="One-year history for {html.escape(title, quote=True)}">'
+        f"{_sparkline_zero_line(low, high)}{paths}</svg>"
+    )
+
+
+def _sparkline_traces(figure: Figure) -> tuple[object | None, list[object]]:
     anchor = next(
         (
             item
@@ -319,99 +357,94 @@ def _sparkline_svg(figure: Figure, title: str) -> str:
             None,
         )
     if anchor is None or anchor.y is None or anchor.x is None:
-        return _empty_sparkline(title)
+        return None, []
     if not series:
         series = [anchor]
+    return anchor, series
 
-    anchor_points = [
-        (_spark_timestamp(raw_x, index), float(raw_y))
-        for index, (raw_x, raw_y) in enumerate(zip(anchor.x, anchor.y, strict=False))
-        if not _is_missing(raw_y)
-    ]
-    if not anchor_points:
-        return _empty_sparkline(title)
-    recent_anchor = anchor_points[-252:]
-    start = recent_anchor[0][0]
-    end = recent_anchor[-1][0]
-    if end <= start:
-        end = start + 1.0
 
-    plotted: list[tuple[object, list[tuple[float, float | None]]]] = []
-    finite: list[float] = []
-    for trace in series:
-        points: list[tuple[float, float | None]] = []
-        for index, (raw_x, raw_y) in enumerate(
-            zip(
-                trace.x if trace.x is not None else (),
-                trace.y if trace.y is not None else (),
-                strict=False,
-            )
-        ):
-            timestamp = _spark_timestamp(raw_x, index)
-            if timestamp < start or timestamp > end:
-                continue
-            value = None if _is_missing(raw_y) else float(raw_y)
-            points.append((timestamp, value))
-            if value is not None:
-                finite.append(value)
-        if points:
-            plotted.append((trace, points))
-    if not finite:
-        return _empty_sparkline(title)
+def _sparkline_points(
+    trace: object,
+    *,
+    start: float = -math.inf,
+    end: float = math.inf,
+) -> list[tuple[float, float | None]]:
+    points: list[tuple[float, float | None]] = []
+    raw_x_values = getattr(trace, "x", None)
+    raw_y_values = getattr(trace, "y", None)
+    if raw_x_values is None or raw_y_values is None:
+        return points
+    for raw_x, raw_y in zip(raw_x_values, raw_y_values, strict=False):
+        timestamp = _spark_timestamp(raw_x)
+        if timestamp is None or timestamp < start or timestamp > end:
+            continue
+        points.append((timestamp, None if _is_missing(raw_y) else float(raw_y)))
+    return points
 
-    low = min(finite)
-    high = max(finite)
+
+def _sparkline_y_bounds(values: list[float]) -> tuple[float, float]:
+    low = min(values)
+    high = max(values)
     span = high - low
     if span == 0:
         span = max(abs(high) * 0.1, 1.0)
         low -= span / 2
         high += span / 2
+    return low, high
 
+
+def _sparkline_zero_line(low: float, high: float) -> str:
+    if not low < 0 < high:
+        return ""
     width = 240.0
     height = 42.0
     inset = 2.5
-    zero_line = ""
-    if low < 0 < high:
-        zero_y = inset + high / (high - low) * (height - inset * 2)
-        zero_line = (
-            f'<line class="spark-zero" x1="0" y1="{zero_y:.2f}" '
-            f'x2="{width:.0f}" y2="{zero_y:.2f}"></line>'
-        )
-    paths: list[str] = []
-    for trace, points in plotted:
-        commands: list[str] = []
-        drawing = False
-        for timestamp, value in points:
-            if value is None:
-                drawing = False
-                continue
-            x = (timestamp - start) / (end - start) * width
-            y = inset + (high - value) / (high - low) * (height - inset * 2)
-            commands.append(f"{'L' if drawing else 'M'}{x:.2f},{y:.2f}")
-            drawing = True
-        if not commands:
-            continue
-        colour = getattr(getattr(trace, "line", None), "color", None) or "#16211d"
-        paths.append(
-            '<path class="spark-path" '
-            f'style="--spark-stroke:{html.escape(str(colour), quote=True)}" '
-            f'd="{" ".join(commands)}"></path>'
-        )
+    zero_y = inset + high / (high - low) * (height - inset * 2)
     return (
-        '<svg class="sparkline" viewBox="0 0 240 42" preserveAspectRatio="none" '
-        f'role="img" aria-label="One-year history for {html.escape(title, quote=True)}">'
-        f"{zero_line}{''.join(paths)}</svg>"
+        f'<line class="spark-zero" x1="0" y1="{zero_y:.2f}" '
+        f'x2="{width:.0f}" y2="{zero_y:.2f}"></line>'
     )
 
 
-def _spark_timestamp(value: object, fallback: int) -> float:
+def _sparkline_path(
+    trace: object,
+    points: list[tuple[float, float | None]],
+    start: float,
+    end: float,
+    low: float,
+    high: float,
+) -> str:
+    width = 240.0
+    height = 42.0
+    inset = 2.5
+    commands: list[str] = []
+    drawing = False
+    for timestamp, value in points:
+        if value is None:
+            drawing = False
+            continue
+        x = (timestamp - start) / (end - start) * width
+        y = inset + (high - value) / (high - low) * (height - inset * 2)
+        commands.append(f"{'L' if drawing else 'M'}{x:.2f},{y:.2f}")
+        drawing = True
+    if not commands:
+        return ""
+    colour = getattr(getattr(trace, "line", None), "color", None) or "#16211d"
+    return (
+        '<path class="spark-path" '
+        f'style="--spark-stroke:{html.escape(str(colour), quote=True)}" '
+        f'd="{" ".join(commands)}"></path>'
+    )
+
+
+def _spark_timestamp(value: object) -> float | None:
     try:
         return float(value.timestamp())
     except (AttributeError, TypeError, ValueError):
         try:
             return datetime.fromisoformat(str(value)).timestamp()
         except ValueError:
-            return float(fallback)
+            return None
 
 
 def _empty_sparkline(title: str) -> str:
@@ -475,21 +508,6 @@ def _range_controls(available: bool) -> str:
     )
 
 
-def _optional_bool(value: object) -> bool | None:
-    if value is None:
-        return None
-    if isinstance(value, str):
-        normalised = value.strip().lower()
-        if normalised in {"true", "yes", "1"}:
-            return True
-        if normalised in {"false", "no", "0"}:
-            return False
-        return None
-    if _is_missing(value):
-        return None
-    return bool(value)
-
-
 def _is_missing(value: object) -> bool:
     try:
         return not math.isfinite(float(value))
@@ -521,15 +539,12 @@ def _sync_text(
         result += f" · history {with_history}/{holdings}"
     if failures:
         result += f" · {failures} sync error{'s' if failures != 1 else ''}"
-    stale_days = summary.get("stale_business_days")
-    try:
-        stale_count = int(stale_days) if stale_days is not None else None
-    except (TypeError, ValueError):
-        stale_count = None
-    if stale_count is None and session is not None:
-        stale_count = _business_days_since(session, today or date.today())
-    explicitly_stale = _optional_bool(summary.get("latest_is_stale")) is True
-    if stale_count is not None and (explicitly_stale or stale_count > 1):
+    stale_count = (
+        _business_days_since(session, today or date.today())
+        if session is not None
+        else None
+    )
+    if stale_count is not None and stale_count > 1:
         result += f" · STALE ({stale_count} business days behind)"
     unavailable = tuple(summary.get("unavailable_symbols", ()) or ())
     if unavailable:
@@ -552,8 +567,8 @@ def _business_days_since(session: date, today: date) -> int:
     return total
 
 
-def _visible_y_script(plot_ids: Sequence[str]) -> str:
-    """Refit y to visible x data without enabling direct vertical zoom."""
+def _interaction_script(plot_ids: Sequence[str]) -> str:
+    """Link chart selection, readouts, date ranges, and visible-value scaling."""
     ids = json.dumps(list(plot_ids))
     return f"""<script>
 (() => {{
@@ -722,15 +737,9 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
   }};
 
   const displayBounds = plot => {{
-    const bounds = dataBounds(plot);
-    if (!bounds) return null;
-    const end = new Date(bounds[1]);
-    let sessions = 0;
-    while (sessions < 2) {{
-      end.setUTCDate(end.getUTCDate() + 1);
-      if (end.getUTCDay() !== 0 && end.getUTCDay() !== 6) sessions += 1;
-    }}
-    return [bounds[0], end.getTime()];
+    const bounds = plot?._fullLayout?.meta?.display_bounds?.map(asTime);
+    return bounds?.length === 2 && bounds.every(value => value !== null)
+      ? bounds : null;
   }};
 
   const boundedRange = (plot, requestedRange) => {{
@@ -747,13 +756,13 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
   }};
 
   let rangeGeneration = 0;
-  let canonicalRange = null;
   const rangeQueues = new Map();
+  const programmedRanges = new WeakMap();
   const applyLinkedRange = requestedRange => {{
     if (!requestedRange || requestedRange.some(value => value === null)) {{
       return Promise.resolve();
     }}
-    canonicalRange = requestedRange.slice();
+    const linkedRange = requestedRange.slice();
     const generation = ++rangeGeneration;
     const updates = [];
     for (const id of plotIds) {{
@@ -762,16 +771,14 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
       const previous = rangeQueues.get(id) || Promise.resolve();
       const update = previous.catch(() => undefined).then(() => {{
         if (generation !== rangeGeneration) return;
-        const targetRange = boundedRange(target, canonicalRange);
+        const targetRange = boundedRange(target, linkedRange);
         if (!targetRange) return;
-        target.dataset.syncingX = String(generation);
-        target.dataset.syncRange = JSON.stringify(targetRange);
+        programmedRanges.set(target, {{generation, range: targetRange}});
         return Plotly.relayout(target, {{
           "xaxis.range": targetRange.map(value => new Date(value).toISOString()),
         }}).then(() => fitVisibleY(target)).finally(() => {{
-          if (target.dataset.syncingX === String(generation)) {{
-            delete target.dataset.syncingX;
-            delete target.dataset.syncRange;
+          if (programmedRanges.get(target)?.generation === generation) {{
+            programmedRanges.delete(target);
           }}
         }});
       }});
@@ -782,8 +789,8 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
   }};
 
   const isProgrammedRange = plot => {{
-    if (!plot.dataset.syncingX || !plot.dataset.syncRange) return false;
-    const intended = JSON.parse(plot.dataset.syncRange);
+    const intended = programmedRanges.get(plot)?.range;
+    if (!intended) return false;
     const current = plot?._fullLayout?.xaxis?.range?.map(asTime);
     return current && current.every((value, index) =>
       value !== null && Math.abs(value - intended[index]) < 1000);
@@ -818,9 +825,7 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
       const proposedSpan = Math.min(fullSpan, Math.max(minimumSpan, currentSpan * factor));
       if (proposedSpan >= fullSpan) {{
         if (Math.abs(current[0] - bounds[0]) < 1 && Math.abs(current[1] - bounds[1]) < 1) return;
-        Plotly.relayout(plot, {{
-          "xaxis.range": bounds.map(value => new Date(value).toISOString()),
-        }}).then(() => fitVisibleY(plot));
+        applyLinkedRange(bounds);
         return;
       }}
 
@@ -836,9 +841,7 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
         end = bounds[1];
         start = end - proposedSpan;
       }}
-      Plotly.relayout(plot, {{
-        "xaxis.range": [new Date(start).toISOString(), new Date(end).toISOString()],
-      }}).then(() => fitVisibleY(plot));
+      applyLinkedRange([start, end]);
     }}, {{passive: false}});
   }};
 
@@ -932,29 +935,17 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
     selector.addEventListener("click", () => activateChart(selector));
   }}
 
-  const responsiveDefaults = new Map();
   const applyResponsiveLayout = () => {{
     const compact = compactQuery.matches;
     const updates = [];
     for (const id of plotIds) {{
       const plot = document.getElementById(id);
       if (!plot?._fullLayout) continue;
-      if (!responsiveDefaults.has(id)) {{
-        responsiveDefaults.set(id, {{
-          marginTop: Number(plot._fullLayout.margin?.t) || 72,
-          marginRight: Number(plot._fullLayout.margin?.r) || 26,
-        }});
-      }}
-      const defaults = responsiveDefaults.get(id);
       updates.push(
         Plotly.relayout(plot, {{
-          "showlegend": false,
-          "margin.t": compact ? 20 : defaults.marginTop,
-          "margin.r": compact ? Math.max(42, defaults.marginRight) : defaults.marginRight,
-        }}).then(() => {{
-          Plotly.Plots.resize(plot);
-          return fitVisibleY(plot);
-        }})
+          "margin.t": compact ? 20 : 28,
+          "margin.r": compact ? 42 : 26,
+        }}).then(() => fitVisibleY(plot))
       );
     }}
     return Promise.allSettled(updates);
@@ -990,14 +981,6 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
         key === "xaxis.autorange" || key.startsWith("xaxis.range")
       )) scheduleFit();
     }});
-    plot.on("plotly_legendclick", () => setTimeout(scheduleFit, 50));
-    plot.on("plotly_legenddoubleclick", () => setTimeout(scheduleFit, 50));
-    plot.on("plotly_restyle", changes => {{
-      const update = Array.isArray(changes) ? changes[0] : changes;
-      if (update && Object.prototype.hasOwnProperty.call(update, "visible")) {{
-        setTimeout(scheduleFit, 50);
-      }}
-    }});
     plot.on("plotly_hover", event => updateHoverReadout(plot, event));
     plot.on("plotly_unhover", () => resetHoverReadout(plot));
     attachBoundedWheelZoom(plot);
@@ -1007,10 +990,6 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
   applyResponsiveLayout()
     .then(() => applyDashboardRange("1y"))
     .then(() => {{ document.documentElement.dataset.dashboardReady = "true"; }});
-  if (typeof compactQuery.addEventListener === "function") {{
-    compactQuery.addEventListener("change", applyResponsiveLayout);
-  }} else {{
-    compactQuery.addListener(applyResponsiveLayout);
-  }}
+  compactQuery.addEventListener("change", applyResponsiveLayout);
 }})();
 </script>"""

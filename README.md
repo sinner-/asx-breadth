@@ -89,13 +89,13 @@ src/asx_breadth/
   holdings.py                    workbook discovery and symbol mapping
   db.py                          versioned universes + append-only observations/factors
   providers/yahoo.py             replaceable provider adapter
-  sync.py                        batching, retries, backoff, incremental watermarks
+  sync.py                        request planning, batching, retries, and obligation state
   indicators/
     base.py                      dependency-aware indicator protocol
     benchmark_trend.py           VAS total return and high/low hysteresis band
     geometric_index.py           equal-dollar geometric constituent total-return index
     currency_index_trend.py      actual XDA level and 19/39/200-session EMAs
-    series_level.py              shared reconstruction for single published indices
+    series_level.py              shared published-series reconstruction and EMA engine
     volatility_trend.py          actual AXVI level and 200-session EMA
     advance_decline.py           consecutive-session A/D
     mcclellan.py                 ratio-adjusted oscillator and summation
@@ -124,7 +124,7 @@ or chronologically older workbook unless the explicit `--allow-suspicious-holdin
 hatch is used. `--no-download` also refuses to make a never-synchronised snapshot
 authoritative.
 
-The benchmark and other named market series are stored as role-based auxiliary universe
+The benchmark and other named market series are stored uniformly as role-based universe
 series. They share the same factor cache, retry/backoff, 1,000-session initial backfill, and
 incremental watermarks as holdings, but never enter point-in-time membership or breadth
 counts. AXVI is registered under the `volatility` role with Yahoo symbol `^AXVI`; XDA
@@ -150,10 +150,11 @@ requires changes to Yahoo synchronisation.
   Membership is selected point-in-time from the dated holdings snapshots.
 - Missing data, trading halts, and resumptions are excluded for the affected A/D day; they
   are not silently called unchanged or treated as a multi-day move.
-- A broad-universe session is withheld from cumulative A/D and McClellan calculations when
-  quote coverage is below the greater of 90% or 95% of the trailing 60-session median. Raw
-  counts and the rejected coverage remain visible for diagnosis; cumulative and EMA state
-  hold until the next accepted session.
+- A session is withheld from cumulative A/D and McClellan calculations when quote coverage
+  is below the greater of 90% or 95% of the trailing 60-session median, unless exactly one
+  issue is unavailable. At least one real quote is always required. Raw counts and rejected
+  coverage remain visible for diagnosis; cumulative and EMA state hold until the next
+  accepted session.
 - Ratio-adjusted net advances are exactly
   `1000 × (advances - declines) / (advances + declines)`; unchanged issues are
   excluded from this denominator.
@@ -203,14 +204,18 @@ from valid cached data.
 
 ```bash
 uv run tests/test_core.py
+uv run tests/test_whitebox_methodology.py
+uv run tests/test_whitebox_sync.py
 uv run tests/check_dashboard.py
+DASHBOARD_BROWSER=firefox uv run tests/check_dashboard.py
 ```
 
 The tests cover workbook admission, effective-dated composition changes, persistent
 transition syncing, audited factor repair, response-anchor/history validation, benchmark
-session policy, auxiliary-series caching, AXVI level reconstruction, gap/halt and coverage
+session policy, role-based market-series caching, AXVI level reconstruction, gap/halt and coverage
 policy, RASI state, point-in-time new-high/low eligibility, and horizontal-only chart
 configuration. The committed browser smoke check exercises the generated report's linked
 zoom, sticky date controls, visible-range y fitting, exact bicolour RASI and AXVI regimes,
 external hover readouts, responsive legends, viewport changes, and accessibility wiring. It
-uses system Chrome when available; generate `dashboard.html` before running it.
+uses Chromium by default and Firefox when `DASHBOARD_BROWSER=firefox`; generate
+`dashboard.html` before running it.

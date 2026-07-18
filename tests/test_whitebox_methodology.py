@@ -25,7 +25,8 @@ from asx_breadth.indicators.benchmark_trend import BenchmarkTrend
 from asx_breadth.indicators.geometric_index import GeometricIndex
 from asx_breadth.indicators.mcclellan import RatioAdjustedMcClellan
 from asx_breadth.indicators.new_highs_lows import NewHighLow, _price_extremes
-from asx_breadth.models import Snapshot, SnapshotInstrument
+from asx_breadth.indicators.quality import session_quality
+from asx_breadth.models import Snapshot, SnapshotInstrument, SnapshotSeries
 
 
 class WhiteboxMethodologyTests(unittest.TestCase):
@@ -38,13 +39,25 @@ class WhiteboxMethodologyTests(unittest.TestCase):
             as_of_date=date(2026, 7, 3),
             source_path="holdings.xlsx",
             instruments=(self.instrument,),
+            market_series=(SnapshotSeries("benchmark", self.instrument),),
         )
+
+    def test_quality_tolerates_one_halt_but_not_a_small_universe_outage(self) -> None:
+        index = pd.to_datetime(["2026-07-01", "2026-07-02"])
+        quality = session_quality(
+            pd.Series([2, 0], index=index),
+            pd.Series([3, 3], index=index),
+        )
+
+        self.assertTrue(quality.iloc[0]["quality_ok"])
+        self.assertFalse(quality.iloc[1]["quality_ok"])
 
     def test_price_extremes_apply_dividend_and_split_adjustment(self) -> None:
         dates = pd.date_range("2026-07-01", periods=4, freq="D")
         factors = pd.DataFrame(
             {
                 "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
                 "close_to_previous_close": [None, 1.0, 0.95, 0.50],
                 "total_return_factor": [None, 1.0, 1.0, 1.0],
                 "high_to_previous_close": [None, 1.01, 0.96, 0.52],
@@ -115,8 +128,8 @@ class WhiteboxMethodologyTests(unittest.TestCase):
             IndicatorContext(
                 snapshot=self.snapshot,
                 factors=pd.DataFrame(),
-                benchmark_factors=factors,
-                benchmark_anchor_price=132.0,
+                series_factors={"benchmark": factors},
+                series_anchor_prices={"benchmark": 132.0},
             ),
             {},
         )
@@ -129,12 +142,37 @@ class WhiteboxMethodologyTests(unittest.TestCase):
         self.assertTrue(pd.isna(result.frame.iloc[2]["adjusted_high_index"]))
         self.assertAlmostEqual(result.frame.iloc[3]["adjusted_high_index"], 125.0)
 
+    def test_benchmark_without_a_real_price_anchor_is_unavailable(self) -> None:
+        dates = pd.bdate_range("2026-07-01", periods=3)
+        factors = pd.DataFrame(
+            {
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "total_return_factor": [None, 1.01, 1.02],
+                "close_to_previous_close": [None, 1.01, 1.02],
+                "high_to_previous_close": [None, 1.02, 1.03],
+                "low_to_previous_close": [None, 0.99, 1.00],
+            }
+        )
+
+        result = BenchmarkTrend().calculate(
+            IndicatorContext(
+                snapshot=self.snapshot,
+                factors=pd.DataFrame(),
+                series_factors={"benchmark": factors},
+            ),
+            {},
+        )
+
+        self.assertTrue(result.frame.empty)
+
     def test_dividend_price_drop_does_not_create_a_false_new_low(self) -> None:
         dates = pd.date_range("2026-07-01", periods=4, freq="D")
         factors = pd.DataFrame(
             {
                 "instrument_id": [1] * 4,
                 "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
                 "close_to_previous_close": [None, 1.0, 1.0, 0.95],
                 "total_return_factor": [None, 1.0, 1.0, 1.0],
                 "high_to_previous_close": [None, 1.01, 1.01, 0.96],
@@ -145,7 +183,7 @@ class WhiteboxMethodologyTests(unittest.TestCase):
             IndicatorContext(
                 snapshot=self.snapshot,
                 factors=factors,
-                benchmark_factors=pd.DataFrame({"trade_date": dates}),
+                series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
             ),
             {},
         )
@@ -201,8 +239,8 @@ class WhiteboxMethodologyTests(unittest.TestCase):
         context = IndicatorContext(
             snapshot=self.snapshot,
             factors=factors,
-            benchmark_factors=pd.DataFrame({"trade_date": dates}),
             membership=membership,
+            series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
         )
 
         ad = AdvanceDecline().calculate(context, {}).frame
@@ -248,7 +286,7 @@ class WhiteboxMethodologyTests(unittest.TestCase):
         context = IndicatorContext(
             snapshot=snapshot,
             factors=pd.DataFrame(rows),
-            benchmark_factors=pd.DataFrame({"trade_date": dates}),
+            series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
         )
 
         ad = AdvanceDecline().calculate(context, {}).frame

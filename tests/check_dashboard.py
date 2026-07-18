@@ -10,6 +10,7 @@ Run with: uv run tests/check_dashboard.py [dashboard.html]
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -27,14 +28,20 @@ if not html_path.is_file():
 
 errors: list[str] = []
 with sync_playwright() as playwright:
-    launch_options: dict[str, object] = {
-        "headless": True,
-        "args": ["--allow-file-access-from-files"],
-    }
-    system_chrome = Path("/usr/bin/google-chrome")
-    if system_chrome.is_file():
-        launch_options["executable_path"] = str(system_chrome)
-    browser = playwright.chromium.launch(**launch_options)
+    browser_name = os.environ.get("DASHBOARD_BROWSER", "chromium")
+    if browser_name == "firefox":
+        browser = playwright.firefox.launch(headless=True)
+    elif browser_name == "chromium":
+        launch_options: dict[str, object] = {
+            "headless": True,
+            "args": ["--allow-file-access-from-files"],
+        }
+        system_chrome = Path("/usr/bin/google-chrome")
+        if system_chrome.is_file():
+            launch_options["executable_path"] = str(system_chrome)
+        browser = playwright.chromium.launch(**launch_options)
+    else:
+        raise SystemExit(f"Unsupported DASHBOARD_BROWSER: {browser_name}")
     page = browser.new_page(viewport={"width": 900, "height": 800})
     page.on("pageerror", lambda error: errors.append(f"page: {error}"))
     page.on(
@@ -97,6 +104,9 @@ with sync_playwright() as playwright:
             kpiValues: Object.fromEntries([...document.querySelectorAll('.chart-selector')]
               .map(card => [card.querySelector('.kpi-label')?.textContent,
                 card.querySelector('strong')?.textContent])),
+            kpiDetails: Object.fromEntries([...document.querySelectorAll('.chart-selector')]
+              .map(card => [card.querySelector('.kpi-label')?.textContent,
+                card.querySelector('small')?.textContent])),
             mastheads: document.querySelectorAll('header, h1, .eyebrow').length,
             footers: document.querySelectorAll('footer').length,
             footerText: document.querySelector('footer')?.textContent || '',
@@ -222,6 +232,29 @@ with sync_playwright() as playwright:
         "XDA",
     ], initial
     assert initial["kpiValues"]["New 52-week lows"].endswith(" lows"), initial
+    for label in (
+        "VAS total return",
+        "ASX 300 geometric",
+        "Cumulative A/D",
+        "AXVI",
+        "XDA",
+    ):
+        detail = initial["kpiDetails"][label]
+        assert any(
+            term in detail for term in ("Above", "Below", "At", "unavailable")
+        ), (
+            label,
+            detail,
+        )
+    for label in ("ASX 300 geometric", "Cumulative A/D", "XDA"):
+        detail = initial["kpiDetails"][label]
+        assert all(ema in detail for ema in ("EMA19", "EMA39", "EMA200")), (
+            label,
+            detail,
+        )
+    oscillator_detail = initial["kpiDetails"]["McClellan oscillator"]
+    assert "Breadth momentum" in oscillator_detail, oscillator_detail
+    assert "impulse" not in oscillator_detail.lower(), oscillator_detail
     assert initial["mastheads"] == 0 and initial["footers"] == 1, initial
     assert "holdings as at" in initial["footerText"], initial
     assert "Generated" in initial["footerText"], initial
@@ -433,21 +466,75 @@ with sync_playwright() as playwright:
     # captured by the plot.
     page.evaluate("window.scrollTo(0, 0)")
     page.wait_for_timeout(100)
-    before_x = benchmark.evaluate("plot => plot._fullLayout.xaxis.range.slice()")
-    before_scroll = page.evaluate("window.scrollY")
     box = benchmark.locator(".nsewdrag").bounding_box()
     assert box is not None
+    active_hit_target = page.evaluate(
+        """
+        ([x, y]) => ({
+          surfaces: document.elementsFromPoint(x, y)
+            .filter(node => node.matches?.('.nsewdrag')).length,
+          plot: document.elementFromPoint(x, y)?.closest?.('.js-plotly-plot')?.id,
+          hiddenViews: [...document.querySelectorAll('.chart-view:not(.is-active)')]
+            .filter(view => getComputedStyle(view).display !== 'none').length,
+        })
+        """,
+        [box["x"] + box["width"] / 2, box["y"] + box["height"] / 2],
+    )
+    assert active_hit_target == {
+        "surfaces": 1,
+        "plot": "plot-benchmark-trend-chart",
+        "hiddenViews": 0,
+    }, active_hit_target
     page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
     assert (
         benchmark.locator(".nsewdrag").evaluate("node => getComputedStyle(node).cursor")
         == "default"
     )
-    page.mouse.down()
-    assert (
-        benchmark.locator(".nsewdrag").evaluate("node => getComputedStyle(node).cursor")
-        == "ew-resize"
+    default_benchmark_meta = page.locator("#hover-plot-benchmark-trend-chart").locator(
+        "xpath=ancestor::div[contains(@class, 'chart-meta')]"
     )
+    default_benchmark_text = default_benchmark_meta.text_content()
+    page.mouse.move(box["x"] + box["width"] * 0.2, box["y"] + box["height"] * 0.45)
+    page.wait_for_timeout(150)
+    hovered_benchmark_text = default_benchmark_meta.text_content()
+    assert hovered_benchmark_text != default_benchmark_text
+    assert default_benchmark_meta.locator(".legend-value").count() == 5
+    assert all(
+        value.strip()
+        for value in default_benchmark_meta.locator(".legend-value").all_text_contents()
+    )
+    page.mouse.down()
+    page.mouse.move(box["x"] + box["width"] * 0.7, box["y"] + box["height"] * 0.45)
+    page.wait_for_timeout(100)
+    drag_cue = benchmark.evaluate(
+        """
+        plot => {
+          const cover = document.querySelector('.dragcover');
+          const box = plot.querySelector('.zoombox');
+          return {
+            cursor: cover ? getComputedStyle(cover).cursor : null,
+            display: box ? getComputedStyle(box).display : null,
+            fill: box ? getComputedStyle(box).fill : null,
+            stroke: box ? getComputedStyle(box).stroke : null,
+          };
+        }
+        """
+    )
+    assert drag_cue["cursor"] == "ew-resize", drag_cue
+    assert drag_cue["display"] != "none", drag_cue
+    assert drag_cue["fill"] == "rgba(63, 111, 160, 0.2)", drag_cue
+    assert drag_cue["stroke"] == "rgb(63, 111, 160)", drag_cue
     page.mouse.up()
+    page.mouse.move(0, 0)
+    page.wait_for_timeout(600)
+    expected_benchmark_text = next(
+        item["text"]
+        for item in initial["defaultReadouts"]
+        if item["id"] == "plot-benchmark-trend-chart"
+    )
+    assert default_benchmark_meta.text_content() == expected_benchmark_text
+    before_x = benchmark.evaluate("plot => plot._fullLayout.xaxis.range.slice()")
+    before_scroll = page.evaluate("window.scrollY")
     page.mouse.wheel(0, 500)
     page.wait_for_timeout(250)
     after_x = benchmark.evaluate("plot => plot._fullLayout.xaxis.range.slice()")
@@ -620,4 +707,13 @@ with sync_playwright() as playwright:
     browser.close()
 
 assert not errors, errors
-print(json.dumps({"dashboard": str(html_path), **initial, "mobile": mobile}))
+print(
+    json.dumps(
+        {
+            "dashboard": str(html_path),
+            "browser": browser_name,
+            **initial,
+            "mobile": mobile,
+        }
+    )
+)

@@ -20,6 +20,7 @@ NORMALISED_COLUMNS = {
     "stock splits": "split_ratio",
     "repaired?": "repaired",
 }
+NORMALISED_COLUMN_ORDER = tuple(NORMALISED_COLUMNS.values())
 
 
 class YahooProvider:
@@ -34,6 +35,8 @@ class YahooProvider:
         threads: int,
         timeout: float,
     ) -> dict[str, pd.DataFrame]:
+        if threads < 1 or timeout <= 0:
+            raise ValueError("Yahoo threads and timeout must be positive")
         requested = list(dict.fromkeys(symbols))
         if not requested:
             return {}
@@ -56,27 +59,27 @@ class YahooProvider:
         # response when the instrument lacks the metadata repair expects. Keep
         # repaired data as the default, but retry only missing caret-prefixed
         # index symbols without repair. Constituents never take this path.
-        fallback_symbols = [
+        unrepaired_symbols = [
             symbol
             for symbol in requested
             if symbol.startswith("^") and (symbol not in result or result[symbol].empty)
         ]
-        if fallback_symbols:
-            fallback = _download(
-                fallback_symbols,
+        if unrepaired_symbols:
+            unrepaired_data = _download(
+                unrepaired_symbols,
                 start=start,
                 end=end,
                 threads=threads,
                 timeout=timeout,
                 repair=False,
             )
-            fallback_result = _normalise_download(
-                fallback,
-                fallback_symbols,
+            unrepaired_result = _normalise_download(
+                unrepaired_data,
+                unrepaired_symbols,
                 start=start,
                 end=end,
             )
-            for symbol, frame in fallback_result.items():
+            for symbol, frame in unrepaired_result.items():
                 if not frame.empty:
                     result[symbol] = frame
         return result
@@ -102,7 +105,7 @@ def _download(
         repair=repair,
         keepna=False,
         group_by="ticker",
-        threads=min(max(threads, 1), len(symbols)),
+        threads=min(threads, len(symbols)),
         progress=False,
         timeout=timeout,
         ignore_tz=True,
@@ -147,30 +150,46 @@ def _symbol_frame(
 
 
 def _normalise(frame: pd.DataFrame, *, start: date, end: date) -> pd.DataFrame:
-    if isinstance(frame.columns, pd.MultiIndex):
-        frame.columns = [str(column[-1]) for column in frame.columns]
-    renamed: dict[object, str] = {}
-    for column in frame.columns:
-        key = str(column).strip().lower()
-        if key in NORMALISED_COLUMNS:
-            renamed[column] = NORMALISED_COLUMNS[key]
-    frame = frame.rename(columns=renamed)
-    if "close" not in frame.columns:
-        return pd.DataFrame()
-    if "adjusted_close" not in frame.columns:
+    frame = _rename_provider_columns(frame.copy())
+    if not {"close", "adjusted_close"}.issubset(frame.columns):
         # Total-return methodology requires a real adjusted series. Silently
         # substituting Close would turn one symbol into price return.
         return pd.DataFrame()
-    zero_columns = {"dividend", "split_ratio"}
-    for column in NORMALISED_COLUMNS.values():
+    frame = _complete_provider_columns(frame)
+    frame = _normalise_index(frame, start=start, end=end)
+    return _normalise_values(frame)
+
+
+def _rename_provider_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    if isinstance(frame.columns, pd.MultiIndex):
+        frame.columns = [str(column[-1]) for column in frame.columns]
+    return frame.rename(
+        columns={
+            column: NORMALISED_COLUMNS[key]
+            for column in frame.columns
+            if (key := str(column).strip().lower()) in NORMALISED_COLUMNS
+        }
+    )
+
+
+def _complete_provider_columns(frame: pd.DataFrame) -> pd.DataFrame:
+    for column in NORMALISED_COLUMN_ORDER:
         if column not in frame.columns:
             if column == "repaired":
                 frame[column] = False
-            elif column in zero_columns:
+            elif column in {"dividend", "split_ratio"}:
                 frame[column] = 0.0
             else:
                 frame[column] = float("nan")
-    frame = frame[list(NORMALISED_COLUMNS.values())]
+    return frame[list(NORMALISED_COLUMN_ORDER)]
+
+
+def _normalise_index(
+    frame: pd.DataFrame,
+    *,
+    start: date,
+    end: date,
+) -> pd.DataFrame:
     frame.index = pd.to_datetime(frame.index, errors="coerce")
     if getattr(frame.index, "tz", None) is not None:
         frame.index = frame.index.tz_localize(None)
@@ -178,7 +197,10 @@ def _normalise(frame: pd.DataFrame, *, start: date, end: date) -> pd.DataFrame:
     frame = frame[~frame.index.duplicated(keep="last")].sort_index()
     start_timestamp = pd.Timestamp(start)
     end_timestamp = pd.Timestamp(end)
-    frame = frame[(frame.index >= start_timestamp) & (frame.index < end_timestamp)]
+    return frame[(frame.index >= start_timestamp) & (frame.index < end_timestamp)]
+
+
+def _normalise_values(frame: pd.DataFrame) -> pd.DataFrame:
     numeric = [column for column in frame.columns if column != "repaired"]
     frame[numeric] = frame[numeric].apply(pd.to_numeric, errors="coerce")
     frame[numeric] = frame[numeric].replace([float("inf"), float("-inf")], pd.NA)

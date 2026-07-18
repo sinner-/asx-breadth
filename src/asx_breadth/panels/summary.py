@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import math
 from datetime import datetime
-from typing import Sequence
 
 from ..indicators.base import IndicatorResult
 
@@ -36,12 +35,6 @@ def percent(value: object) -> str:
         return "—"
 
 
-def ema_detail(row: object, columns: Sequence[tuple[str, str]]) -> str:
-    if row is None:
-        return "Unavailable"
-    return " · ".join(f"{label} {number(row[column], 2)}" for column, label in columns)
-
-
 def constituent_share(count: object, eligible: object) -> str:
     if is_missing(count) or is_missing(eligible) or float(eligible) <= 0:
         return "Unavailable"
@@ -55,14 +48,9 @@ def positive(value: object) -> bool:
 
 
 def latest_quality(result: IndicatorResult, latest: object) -> bool | None:
-    for key in (
-        "latest_signal_updated",
-        "latest_quality_ok",
-        "latest_input_quality_ok",
-    ):
-        parsed = optional_bool(result.metadata.get(key))
-        if parsed is not None:
-            return parsed
+    signal_updated = optional_bool(result.metadata.get("latest_signal_updated"))
+    if signal_updated is not None:
+        return signal_updated
     if latest is None:
         return None
     try:
@@ -112,8 +100,6 @@ def relative_state(
     value: object,
     ema19: object,
     ema39: object,
-    *,
-    include_values: bool = False,
 ) -> tuple[str, str]:
     if any(is_missing(item) for item in (value, ema19, ema39)):
         return "Trend unavailable", "neutral"
@@ -128,7 +114,7 @@ def relative_state(
             relation = f"Below {name}"
         else:
             relation = f"At {name}"
-        return f"{relation} ({average:.2f})" if include_values else relation
+        return relation
 
     if level > max(short, long):
         tone = "positive"
@@ -137,6 +123,19 @@ def relative_state(
     else:
         tone = "neutral"
     return f"{comparison('EMA19', short)} · {comparison('EMA39', long)}", tone
+
+
+def level_state(value: object, reference: object, label: str) -> str:
+    """Describe a plotted level relative to one reference line."""
+    if is_missing(value) or is_missing(reference):
+        return f"{label} unavailable"
+    level = float(value)
+    comparison = float(reference)
+    if level > comparison:
+        return f"Above {label}"
+    if level < comparison:
+        return f"Below {label}"
+    return f"At {label}"
 
 
 def band_state(value: object, low: object, high: object) -> tuple[str, str]:

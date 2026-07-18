@@ -14,8 +14,6 @@ from ..models import Snapshot
 class IndicatorContext:
     snapshot: Snapshot
     factors: pd.DataFrame
-    benchmark_factors: pd.DataFrame = field(default_factory=pd.DataFrame)
-    benchmark_anchor_price: float | None = None
     membership: pd.DataFrame = field(default_factory=pd.DataFrame)
     series_factors: Mapping[str, pd.DataFrame] = field(default_factory=dict)
     series_anchor_prices: Mapping[str, float | None] = field(default_factory=dict)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import math
 import re
 from datetime import date, datetime
 from pathlib import Path
@@ -120,6 +121,8 @@ def _number(value: Any, *, percentage: bool = False) -> float | None:
         return None
     if isinstance(value, (int, float)):
         number = float(value)
+        if not math.isfinite(number):
+            return None
         return number if not percentage or number <= 1 else number / 100
     text = str(value).strip()
     is_percent = text.endswith("%")
@@ -128,7 +131,24 @@ def _number(value: Any, *, percentage: bool = False) -> float | None:
         number = float(text)
     except ValueError:
         return None
-    return number / 100 if percentage and is_percent else number
+    if not math.isfinite(number):
+        return None
+    return number / 100 if percentage and (is_percent or number > 1) else number
+
+
+def _holding_number(
+    value: Any,
+    *,
+    label: str,
+    row_number: int,
+    percentage: bool = False,
+) -> float | None:
+    parsed = _number(value, percentage=percentage)
+    if parsed is None and value is not None and str(value).strip():
+        raise HoldingsSchemaError(
+            f"Holdings workbook has invalid {label} {value!r} on row {row_number}"
+        )
+    return parsed
 
 
 def _as_of_date(rows: list[tuple[Any, ...]]) -> date | None:
@@ -155,6 +175,49 @@ def yahoo_symbol(local_symbol: str, country_code: str | None) -> str:
     if country_code in (None, "", "AU") and "." not in symbol:
         return f"{symbol}.AX"
     return symbol
+
+
+def _holding_from_row(
+    row: tuple[Any, ...],
+    columns: dict[str, int],
+    *,
+    row_number: int,
+) -> Holding:
+    def value(key: str) -> Any:
+        position = columns[key]
+        return row[position] if position < len(row) else None
+
+    ticker = str(value("ticker") or "").strip().upper()
+    name = str(value("name") or "").strip()
+    if not ticker or not name or not re.fullmatch(r"[A-Z0-9.-]+", ticker):
+        raise HoldingsSchemaError(
+            "Holdings workbook has an invalid holding row at "
+            f"{row_number}: expected a name and ASX ticker"
+        )
+    country = str(value("country") or "").strip().upper() or None
+    return Holding(
+        local_symbol=ticker,
+        provider_symbol=yahoo_symbol(ticker, country),
+        name=name,
+        sector=str(value("sector") or "").strip() or None,
+        country_code=country,
+        weight=_holding_number(
+            value("weight"),
+            label="portfolio weight",
+            row_number=row_number,
+            percentage=True,
+        ),
+        market_value=_holding_number(
+            value("market_value"),
+            label="market value",
+            row_number=row_number,
+        ),
+        units=_holding_number(
+            value("units"),
+            label="unit count",
+            row_number=row_number,
+        ),
+    )
 
 
 def parse_holdings(
@@ -187,38 +250,24 @@ def parse_holdings(
 
     fund_name = str(rows[0][0] or path.stem).strip()
     holdings: list[Holding] = []
-    seen: set[str] = set()
-    for row in rows[header_index + 1 :]:
-        ticker_value = row[columns["ticker"]] if columns["ticker"] < len(row) else None
-        name_value = row[columns["name"]] if columns["name"] < len(row) else None
-        ticker = str(ticker_value or "").strip().upper()
-        name = str(name_value or "").strip()
-        if not ticker or not name or not re.fullmatch(r"[A-Z0-9.-]+", ticker):
+    seen: dict[str, int] = {}
+    for row_number, row in enumerate(
+        rows[header_index + 1 :],
+        start=header_index + 2,
+    ):
+        if all(value is None or not str(value).strip() for value in row):
+            if holdings:
+                break
             continue
-        if ticker in seen:
-            continue
-        seen.add(ticker)
-
-        def value(key: str) -> Any:
-            position = columns.get(key)
-            return (
-                row[position] if position is not None and position < len(row) else None
+        holding = _holding_from_row(row, columns, row_number=row_number)
+        if holding.local_symbol in seen:
+            raise HoldingsSchemaError(
+                "Holdings workbook contains duplicate ticker "
+                f"{holding.local_symbol!r} on rows "
+                f"{seen[holding.local_symbol]} and {row_number}"
             )
-
-        country = str(value("country") or "").strip().upper() or None
-        sector = str(value("sector") or "").strip() or None
-        holdings.append(
-            Holding(
-                local_symbol=ticker,
-                provider_symbol=yahoo_symbol(ticker, country),
-                name=name,
-                sector=sector,
-                country_code=country,
-                weight=_number(value("weight"), percentage=True),
-                market_value=_number(value("market_value")),
-                units=_number(value("units")),
-            )
-        )
+        seen[holding.local_symbol] = row_number
+        holdings.append(holding)
 
     if not holdings:
         raise ValueError("The workbook contained no recognisable holdings")

@@ -52,18 +52,11 @@ class Snapshot:
     as_of_date: date
     source_path: str
     instruments: tuple[SnapshotInstrument, ...]
-    benchmark: SnapshotInstrument | None = None
-    auxiliary_series: tuple[SnapshotSeries, ...] = ()
+    market_series: tuple[SnapshotSeries, ...] = ()
 
     def instrument_for_role(self, role: str) -> SnapshotInstrument | None:
-        if role == "benchmark":
-            return self.benchmark
         return next(
-            (
-                series.instrument
-                for series in self.auxiliary_series
-                if series.role == role
-            ),
+            (series.instrument for series in self.market_series if series.role == role),
             None,
         )
 
@@ -71,10 +64,7 @@ class Snapshot:
     def all_instruments(self) -> tuple[SnapshotInstrument, ...]:
         items = list(self.instruments)
         known = {instrument.instrument_id for instrument in items}
-        if self.benchmark is not None and self.benchmark.instrument_id not in known:
-            items.append(self.benchmark)
-            known.add(self.benchmark.instrument_id)
-        for series in self.auxiliary_series:
+        for series in self.market_series:
             if series.instrument.instrument_id not in known:
                 items.append(series.instrument)
                 known.add(series.instrument.instrument_id)
@@ -101,3 +91,17 @@ class SyncOptions:
     timeout: float = 30.0
     batch_pause: float = 1.25
     base_backoff: float = 5.0
+
+    def __post_init__(self) -> None:
+        positive = {
+            "lookback_sessions": self.lookback_sessions,
+            "batch_size": self.batch_size,
+            "threads": self.threads,
+            "retries": self.retries,
+            "timeout": self.timeout,
+        }
+        invalid = [name for name, value in positive.items() if value <= 0]
+        if invalid:
+            raise ValueError(f"Sync options must be positive: {', '.join(invalid)}")
+        if self.batch_pause < 0 or self.base_backoff < 0:
+            raise ValueError("Sync pauses and backoff must be non-negative")

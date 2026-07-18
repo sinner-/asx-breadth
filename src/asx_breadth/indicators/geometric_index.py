@@ -7,7 +7,7 @@ import pandas as pd
 
 from .base import IndicatorContext, IndicatorResult
 from .membership import active_membership_for_sessions, market_sessions
-from .quality import QUALITY_POLICY, session_quality
+from .quality import QUALITY_POLICY, accepted_session_ema, session_quality
 
 
 OUTPUT_COLUMNS = [
@@ -108,7 +108,7 @@ class GeometricIndex:
         )
         accepted = frame["quality_ok"] & frame["daily_geometric_factor"].notna()
         for span in (19, 39, 200):
-            frame[f"geometric_ema{span}"] = _accepted_session_ema(
+            frame[f"geometric_ema{span}"] = accepted_session_ema(
                 frame["geometric_index"], accepted, span=span
             )
 
@@ -156,23 +156,4 @@ def _empty_result(context: IndicatorContext) -> IndicatorResult:
             "base_value": 100.0,
             "universe_size": len(context.snapshot.instruments),
         },
-    )
-
-
-def _accepted_session_ema(
-    series: pd.Series,
-    accepted: pd.Series,
-    *,
-    span: int,
-) -> pd.Series:
-    """Advance EMA state only when the session supplied an accepted factor."""
-    return (
-        series.where(accepted)
-        .ewm(
-            span=span,
-            adjust=False,
-            ignore_na=True,
-            min_periods=span,
-        )
-        .mean()
     )

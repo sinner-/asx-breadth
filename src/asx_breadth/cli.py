@@ -20,6 +20,32 @@ from .sync import SyncReport, synchronise
 ROOT = Path(__file__).resolve().parents[2]
 
 
+def _positive_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 1:
+        raise argparse.ArgumentTypeError("must be at least 1")
+    return parsed
+
+
+def _positive_float(value: str) -> float:
+    parsed = float(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be greater than 0")
+    return parsed
+
+
+def _nonnegative_float(value: str) -> float:
+    parsed = float(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be at least 0")
+    return parsed
+
+
+def _asx_provider_symbol(value: str) -> str:
+    symbol = value.strip().upper()
+    return f"{symbol}.AX" if symbol and "." not in symbol else symbol
+
+
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
         prog="breadth.py",
@@ -60,7 +86,7 @@ def parser() -> argparse.ArgumentParser:
         default="^XDA",
         help="Yahoo symbol for the Australian Dollar Currency Index card (default: %(default)s)",
     )
-    result.add_argument("--lookback-sessions", type=int, default=1000)
+    result.add_argument("--lookback-sessions", type=_positive_int, default=1000)
     result.add_argument(
         "--as-of-date",
         type=date.fromisoformat,
@@ -71,12 +97,12 @@ def parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Import despite snapshot count/date/composition safety checks",
     )
-    result.add_argument("--batch-size", type=int, default=20)
-    result.add_argument("--threads", type=int, default=2)
-    result.add_argument("--retries", type=int, default=4)
-    result.add_argument("--timeout", type=float, default=30.0)
-    result.add_argument("--batch-pause", type=float, default=1.25)
-    result.add_argument("--base-backoff", type=float, default=5.0)
+    result.add_argument("--batch-size", type=_positive_int, default=20)
+    result.add_argument("--threads", type=_positive_int, default=2)
+    result.add_argument("--retries", type=_positive_int, default=4)
+    result.add_argument("--timeout", type=_positive_float, default=30.0)
+    result.add_argument("--batch-pause", type=_nonnegative_float, default=1.25)
+    result.add_argument("--base-backoff", type=_nonnegative_float, default=5.0)
     result.add_argument(
         "--no-download",
         action="store_true",
@@ -140,7 +166,14 @@ def main(argv: Sequence[str] | None = None) -> int:
                 holdings_file,
                 universe_code=universe_code,
                 universe_name=arguments.universe_name,
-                benchmark_symbol=arguments.benchmark_symbol,
+            )
+            benchmark_symbol = _asx_provider_symbol(arguments.benchmark_symbol)
+            snapshot = database.register_universe_series(
+                snapshot.snapshot_id,
+                role="benchmark",
+                provider_symbol=benchmark_symbol,
+                local_symbol=benchmark_symbol.removesuffix(".AX"),
+                name=arguments.universe_name,
             )
             snapshot = database.register_universe_series(
                 snapshot.snapshot_id,
@@ -163,47 +196,32 @@ def main(argv: Sequence[str] | None = None) -> int:
         membership = database.membership_for_snapshot(snapshot.snapshot_id)
         if not arguments.no_download:
             options = SyncOptions(
-                lookback_sessions=max(arguments.lookback_sessions, 1),
-                batch_size=max(arguments.batch_size, 1),
-                threads=max(arguments.threads, 1),
-                retries=max(arguments.retries, 1),
-                timeout=max(arguments.timeout, 1),
-                batch_pause=max(arguments.batch_pause, 0),
-                base_backoff=max(arguments.base_backoff, 0),
+                lookback_sessions=arguments.lookback_sessions,
+                batch_size=arguments.batch_size,
+                threads=arguments.threads,
+                retries=arguments.retries,
+                timeout=arguments.timeout,
+                batch_pause=arguments.batch_pause,
+                base_backoff=arguments.base_backoff,
             )
-            try:
-                sync_targets = database.sync_targets_for_snapshot(snapshot.snapshot_id)
-                sync_report = synchronise(database, sync_targets, options)
-            except KeyboardInterrupt:
-                raise
-            except Exception as exc:
-                # A provider or single-run failure must not prevent a dashboard
-                # from being rebuilt from the last valid cache state.
-                logging.exception("Download stopped safely; using cached data: %s", exc)
+            sync_targets = database.sync_targets_for_snapshot(snapshot.snapshot_id)
+            sync_report = synchronise(database, sync_targets, options)
 
         factors = database.factors_for_membership(membership)
-        benchmark_factors = database.factors_for_instrument(
-            snapshot.benchmark.instrument_id if snapshot.benchmark else None
-        )
-        benchmark_anchor_price = database.latest_adjusted_close(
-            snapshot.benchmark.instrument_id if snapshot.benchmark else None
-        )
         series_factors = {
             series.role: database.factors_for_instrument(
                 series.instrument.instrument_id
             )
-            for series in snapshot.auxiliary_series
+            for series in snapshot.market_series
         }
         series_anchor_prices = {
             series.role: database.latest_adjusted_close(series.instrument.instrument_id)
-            for series in snapshot.auxiliary_series
+            for series in snapshot.market_series
         }
         results = run_indicators(
             IndicatorContext(
                 snapshot=snapshot,
                 factors=factors,
-                benchmark_factors=benchmark_factors,
-                benchmark_anchor_price=benchmark_anchor_price,
                 membership=membership,
                 series_factors=series_factors,
                 series_anchor_prices=series_anchor_prices,

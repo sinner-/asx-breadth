@@ -9,7 +9,7 @@ from .membership import (
     active_membership_for_sessions,
     market_sessions,
 )
-from .quality import QUALITY_POLICY, session_quality
+from .quality import QUALITY_POLICY, accepted_session_ema, session_quality
 
 
 OUTPUT_COLUMNS = [
@@ -42,19 +42,22 @@ class AdvanceDecline:
     ) -> IndicatorResult:
         del results
         factors = context.factors.copy()
-        if factors.empty:
-            return IndicatorResult(
-                key=self.key,
-                title="Advance–Decline",
-                frame=pd.DataFrame(columns=OUTPUT_COLUMNS),
-                metadata={"universe_size": len(context.snapshot.instruments)},
-            )
+        required = {
+            "instrument_id",
+            "trade_date",
+            "previous_trade_date",
+            "total_return_factor",
+        }
+        if factors.empty or not required.issubset(factors.columns):
+            return _empty_result(context)
 
         factors["trade_date"] = pd.to_datetime(factors["trade_date"])
         factors["previous_trade_date"] = pd.to_datetime(
             factors["previous_trade_date"], errors="coerce"
         )
         sessions = market_sessions(context)
+        if len(sessions) < 2:
+            return _empty_result(context)
         membership = active_membership_for_sessions(context, sessions)
         factors = factors.merge(
             membership,
@@ -103,13 +106,13 @@ class AdvanceDecline:
         frame["cumulative_ad"] = frame["net_advances"].fillna(0).cumsum()
         accepted = frame["quality_ok"] & frame["net_advances"].notna()
         for span in (19, 39, 200):
-            frame[f"cumulative_ad_ema{span}"] = _accepted_session_ema(
+            frame[f"cumulative_ad_ema{span}"] = accepted_session_ema(
                 frame["cumulative_ad"], accepted, span=span
             )
-        frame["net_advances_ema19"] = _accepted_session_ema(
+        frame["net_advances_ema19"] = accepted_session_ema(
             frame["net_advances"], accepted, span=19
         )
-        frame["net_advances_ema39"] = _accepted_session_ema(
+        frame["net_advances_ema39"] = accepted_session_ema(
             frame["net_advances"], accepted, span=39
         )
         return IndicatorResult(
@@ -126,20 +129,10 @@ class AdvanceDecline:
         )
 
 
-def _accepted_session_ema(
-    series: pd.Series,
-    accepted: pd.Series,
-    *,
-    span: int,
-) -> pd.Series:
-    """Advance EMA state only when the session supplied accepted breadth."""
-    return (
-        series.where(accepted)
-        .ewm(
-            span=span,
-            adjust=False,
-            ignore_na=True,
-            min_periods=span,
-        )
-        .mean()
+def _empty_result(context: IndicatorContext) -> IndicatorResult:
+    return IndicatorResult(
+        key=AdvanceDecline.key,
+        title="Advance–Decline",
+        frame=pd.DataFrame(columns=OUTPUT_COLUMNS),
+        metadata={"universe_size": len(context.snapshot.instruments)},
     )

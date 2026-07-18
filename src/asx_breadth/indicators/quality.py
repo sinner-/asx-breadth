@@ -6,7 +6,29 @@ import numpy as np
 import pandas as pd
 
 
-QUALITY_POLICY = "Coverage >= max(90%, 95% of trailing 60-session median)"
+QUALITY_POLICY = (
+    "At least one quote and either coverage >= max(90%, 95% of trailing "
+    "60-session median) or no more than one missing issue"
+)
+
+
+def accepted_session_ema(
+    series: pd.Series,
+    accepted: pd.Series,
+    *,
+    span: int,
+) -> pd.Series:
+    """Advance EMA state only when a breadth session is accepted."""
+    return (
+        series.where(accepted)
+        .ewm(
+            span=span,
+            adjust=False,
+            ignore_na=True,
+            min_periods=span,
+        )
+        .mean()
+    )
 
 
 def session_quality(
@@ -18,9 +40,11 @@ def session_quality(
     coverage = available.div(expected.replace(0, np.nan))
     recent_coverage = coverage.shift(1).rolling(window=60, min_periods=10).median()
     floor = (recent_coverage * 0.95).clip(lower=0.90).fillna(0.90)
-    # Small plugin/test universes cannot distinguish a normal single-name halt
-    # from a failed provider batch using cross-sectional coverage alone.
-    accepted = (expected < 20) | (coverage >= floor)
+    # One isolated halt should not freeze breadth, including in a genuinely
+    # small future universe. A broad outage must never pass merely because the
+    # universe itself is small.
+    missing = (expected - available).clip(lower=0)
+    accepted = available.gt(0) & ((coverage >= floor) | (missing <= 1))
     return pd.DataFrame(
         {
             "coverage": coverage,
