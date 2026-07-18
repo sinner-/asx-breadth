@@ -1,10 +1,12 @@
 # ASX Breadth
 
 An append-safe, extensible ASX market-breadth engine. The dashboard combines the VAS
-total-return trend and hysteresis band with advance/decline breadth, the McClellan
-oscillator and Ratio-Adjusted Summation Index (RASI), and 52-week highs, lows, and
-NH-NL. The storage and plugin boundaries remain deliberately broader so further breadth
-families can be added without replacing ingestion.
+total-return trend and hysteresis band with a Value Line-style ASX 300 geometric
+total-return index, the Australian Dollar Currency Index (XDA) with 19/39/200-session
+EMAs, the S&P/ASX 200 VIX (AXVI) and its 200-session EMA,
+advance/decline breadth, the McClellan oscillator and Ratio-Adjusted Summation Index
+(RASI), and 52-week highs, lows, and NH-NL. The storage and plugin boundaries remain
+deliberately broader so further breadth families can be added without replacing ingestion.
 
 ## Run it
 
@@ -38,6 +40,12 @@ uv run breadth.py HOLDINGS.xlsx --db /path/cache.sqlite3 --output /path/report.h
 
 # More conservative provider pacing
 uv run breadth.py HOLDINGS.xlsx --threads 1 --batch-size 10 --batch-pause 3
+
+# Override Yahoo's AXVI symbol if its identifier ever changes
+uv run breadth.py HOLDINGS.xlsx --volatility-symbol '^AXVI'
+
+# Override Yahoo's Australian Dollar Currency Index symbol
+uv run breadth.py HOLDINGS.xlsx --currency-index-symbol '^XDA'
 
 # Use only when a workbook has no trustworthy embedded effective date
 uv run breadth.py HOLDINGS.xlsx --as-of-date 2026-07-17
@@ -81,6 +89,10 @@ src/asx_breadth/
   indicators/
     base.py                      dependency-aware indicator protocol
     benchmark_trend.py           VAS total return and high/low hysteresis band
+    geometric_index.py           equal-dollar geometric constituent total-return index
+    currency_index_trend.py      actual XDA level and 19/39/200-session EMAs
+    series_level.py              shared reconstruction for single published indices
+    volatility_trend.py          actual AXVI level and 200-session EMA
     advance_decline.py           consecutive-session A/D
     mcclellan.py                 ratio-adjusted oscillator and summation
     new_highs_lows.py            52-week highs, lows, and NH-NL
@@ -105,6 +117,12 @@ The importer refuses an undated, implausibly small, badly weighted, sharply disc
 or chronologically older workbook unless the explicit `--allow-suspicious-holdings` escape
 hatch is used. `--no-download` also refuses to make a never-synchronised snapshot
 authoritative.
+
+The benchmark and other named market series are stored as role-based auxiliary universe
+series. They share the same factor cache, retry/backoff, 1,000-session initial backfill, and
+incremental watermarks as holdings, but never enter point-in-time membership or breadth
+counts. AXVI is registered under the `volatility` role with Yahoo symbol `^AXVI`; XDA
+uses the `currency_index` role and Yahoo symbol `^XDA`.
 
 On a composition change, the downloader persists an obligation for every outgoing holding
 and synchronises it alongside the incoming basket. The obligation survives failed runs and
@@ -135,11 +153,28 @@ requires changes to Yahoo synchronisation.
 - McClellan oscillator is the 19-session (10% trend) minus the 39-session
   (5% trend) EMA of that ratio. Both trend recurrences are seeded at zero.
 - RASI is the cumulative oscillator, also seeded at zero.
-- The A/D chart overlays 19- and 39-session EMAs of cumulative A/D. The cache also retains
-  daily net A/D EMAs for future indicator work.
+- The A/D chart overlays 19-, 39-, and 200-session EMAs of cumulative A/D. The cache also
+  retains daily net A/D EMAs for future indicator work.
 - The VAS total-return series is anchored to its latest adjusted close, retaining the
   actual VAS.AX adjusted-price scale. It overlays 19/39-session EMAs plus 200-session EMAs
   of dividend/split-adjusted daily highs and lows as a hysteresis band.
+- The ASX 300 Geometric Index starts at 100 and links the daily geometric mean of
+  consecutive-session adjusted-close total-return factors for the effective-dated VAS
+  basket. It borrows Value Line's equal-dollar geometric construction but neutralises both
+  distributions and splits so ex-dividend dates do not manufacture market weakness. The
+  chart overlays 19-, 39-, and 200-session EMAs of that index. Missing or halted issues are
+  omitted for that session; the shared coverage gate holds the index during a broad data
+  outage.
+- AXVI is a single published index series, not a constituent composite. Its actual level is
+  reconstructed backward from the latest cached `^AXVI` close using append-stable daily
+  factors, then overlaid with a 200-session EMA. The chart shades the distance to the EMA
+  red with a red line while AXVI is above it, and black with a black line while below it.
+  A broken factor chain is left unavailable rather than bridged with invented values.
+- XDA is likewise a single published index rather than a breadth composite. Its actual
+  `^XDA` level is reconstructed from cached daily factors and overlaid with 19-, 39-, and
+  200-session EMAs. Because yfinance's repair mode can reject valid caret-prefixed index
+  history, a missing index alone is retried once from Yahoo without repair; constituent
+  downloads remain on the repaired path.
 - New highs and lows use a 252-session window over the continuous total-return-adjusted high/low
   stream. A constituent must have reached the full calendar age and at least 90% of the
   preceding observations, so an isolated quote gap does not suppress it for another year.
@@ -166,9 +201,9 @@ uv run tests/check_dashboard.py
 
 The tests cover workbook admission, effective-dated composition changes, persistent
 transition syncing, audited factor repair, response-anchor/history validation, benchmark
-session policy, gap/halt and coverage policy, RASI state, point-in-time new-high/low
-eligibility, and horizontal-only chart configuration. The committed browser smoke check
-exercises the generated report's linked zoom, native date controls, visible-range y fitting,
-exact bicolour RASI crossings and hover, responsive legends, viewport changes, and
-accessibility wiring. It uses system Chrome when available; generate `dashboard.html` before
-running it.
+session policy, auxiliary-series caching, AXVI level reconstruction, gap/halt and coverage
+policy, RASI state, point-in-time new-high/low eligibility, and horizontal-only chart
+configuration. The committed browser smoke check exercises the generated report's linked
+zoom, native date controls, visible-range y fitting, exact bicolour RASI and AXVI regimes,
+opaque hover cards, responsive legends, viewport changes, and accessibility wiring. It uses
+system Chrome when available; generate `dashboard.html` before running it.

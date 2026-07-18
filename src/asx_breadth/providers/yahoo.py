@@ -37,39 +37,101 @@ class YahooProvider:
         requested = list(dict.fromkeys(symbols))
         if not requested:
             return {}
-        data = yf.download(
-            tickers=requested,
-            start=start.isoformat(),
-            end=end.isoformat(),
-            interval="1d",
-            actions=True,
-            auto_adjust=False,
-            back_adjust=False,
-            repair=True,
-            keepna=False,
-            group_by="ticker",
-            threads=min(max(threads, 1), len(requested)),
-            progress=False,
+        data = _download(
+            requested,
+            start=start,
+            end=end,
+            threads=threads,
             timeout=timeout,
-            ignore_tz=True,
-            multi_level_index=True,
+            repair=True,
         )
-        if data is None or data.empty:
-            # A wholly empty batch is ambiguous (transport/rate-limit versus
-            # genuine no-data), so it remains retryable rather than evidence.
-            return {}
+        result = _normalise_download(
+            data,
+            requested,
+            start=start,
+            end=end,
+        )
 
-        result: dict[str, pd.DataFrame] = {}
-        for symbol in requested:
-            frame = _symbol_frame(data, symbol, only_symbol=len(requested) == 1)
-            if frame is None:
-                if len(requested) > 1:
-                    result[symbol] = pd.DataFrame()
-                continue
-            normalised = _normalise(frame, start=start, end=end)
-            if not normalised.empty or len(requested) > 1:
-                result[symbol] = normalised
+        # yfinance's repair pass can reject an otherwise valid Yahoo index
+        # response when the instrument lacks the metadata repair expects. Keep
+        # repaired data as the default, but retry only missing caret-prefixed
+        # index symbols without repair. Constituents never take this path.
+        fallback_symbols = [
+            symbol
+            for symbol in requested
+            if symbol.startswith("^") and (symbol not in result or result[symbol].empty)
+        ]
+        if fallback_symbols:
+            fallback = _download(
+                fallback_symbols,
+                start=start,
+                end=end,
+                threads=threads,
+                timeout=timeout,
+                repair=False,
+            )
+            fallback_result = _normalise_download(
+                fallback,
+                fallback_symbols,
+                start=start,
+                end=end,
+            )
+            for symbol, frame in fallback_result.items():
+                if not frame.empty:
+                    result[symbol] = frame
         return result
+
+
+def _download(
+    symbols: list[str],
+    *,
+    start: date,
+    end: date,
+    threads: int,
+    timeout: float,
+    repair: bool,
+) -> pd.DataFrame:
+    return yf.download(
+        tickers=symbols,
+        start=start.isoformat(),
+        end=end.isoformat(),
+        interval="1d",
+        actions=True,
+        auto_adjust=False,
+        back_adjust=False,
+        repair=repair,
+        keepna=False,
+        group_by="ticker",
+        threads=min(max(threads, 1), len(symbols)),
+        progress=False,
+        timeout=timeout,
+        ignore_tz=True,
+        multi_level_index=True,
+    )
+
+
+def _normalise_download(
+    data: pd.DataFrame | None,
+    requested: list[str],
+    *,
+    start: date,
+    end: date,
+) -> dict[str, pd.DataFrame]:
+    if data is None or data.empty:
+        # A wholly empty batch is ambiguous (transport/rate-limit versus
+        # genuine no-data), so it remains retryable rather than evidence.
+        return {}
+    result: dict[str, pd.DataFrame] = {}
+    for symbol in requested:
+        frame = _symbol_frame(data, symbol, only_symbol=len(requested) == 1)
+        if frame is None:
+            if len(requested) > 1:
+                result[symbol] = pd.DataFrame()
+            continue
+        normalised = _normalise(frame, start=start, end=end)
+        if not normalised.empty or len(requested) > 1:
+            result[symbol] = normalised
+    return result
 
 
 def _symbol_frame(

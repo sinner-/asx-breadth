@@ -47,7 +47,7 @@ with sync_playwright() as playwright:
     )
     page.goto(html_path.as_uri(), wait_until="load")
     page.wait_for_function(
-        "document.querySelectorAll('.js-plotly-plot').length === 7"
+        "document.querySelectorAll('.js-plotly-plot').length === 10"
         " && [...document.querySelectorAll('.js-plotly-plot')]"
         ".every(plot => plot._fullLayout)"
     )
@@ -57,9 +57,22 @@ with sync_playwright() as playwright:
         () => {
           const plots = [...document.querySelectorAll('.js-plotly-plot')];
           const rasi = document.getElementById('plot-rasi-chart');
+          const ad = document.getElementById('plot-ad-chart');
+          const geometric = document.getElementById('plot-geometric-index-chart');
+          const volatility = document.getElementById('plot-volatility-trend-chart');
+          const currency = document.getElementById('plot-currency-index-trend-chart');
+          const geometricTrace = geometric._fullData.find(
+            trace => trace.name === 'Geometric index');
           const positive = rasi._fullData.find(trace => trace.name === 'RASI above zero');
           const negative = rasi._fullData.find(trace => trace.name === 'RASI below zero');
           const carrier = rasi._fullData.find(trace => trace.name === 'RASI');
+          const axviAbove = volatility._fullData.find(
+            trace => trace.name === 'AXVI above EMA');
+          const axviBelow = volatility._fullData.find(
+            trace => trace.name === 'AXVI below EMA');
+          const axviCarrier = volatility._fullData.find(trace => trace.name === 'AXVI');
+          const axviFillTraces = volatility._fullData.filter(
+            trace => trace.name?.startsWith('AXVI ') && trace.name.includes(' EMA fill '));
           const zeros = trace => new Set(trace.x
             .filter((_, index) => Number(trace.y[index]) === 0)
             .map(value => new Date(value).getTime()));
@@ -94,18 +107,43 @@ with sync_playwright() as playwright:
               const id = section.getAttribute('aria-labelledby');
               return id && document.getElementById(id);
             }),
+            chartHeadings: [...document.querySelectorAll('.chart-card h2')]
+              .map(heading => heading.textContent),
             chartRoles: plots.every(plot => plot.getAttribute('role') === 'group'),
             sharedRasiCrossings: sharedZeros.length,
             weekendRasiCrossings: weekendCrossings.length,
             carrierHover: carrier?.hovertemplate || '',
             carrierPoints: carrier?.x?.length || 0,
             visualPoints: positive?.x?.length || 0,
+            geometricPoints: geometricTrace?.x?.length || 0,
+            geometricHover: geometricTrace?.hovertemplate || '',
+            geometricSeries: geometric._fullData
+              .filter(trace => [...(trace.y || [])].some(value => Number.isFinite(Number(value))))
+              .map(trace => trace.name),
+            axviAbovePoints: axviAbove?.y?.filter(value => Number.isFinite(Number(value))).length || 0,
+            axviBelowPoints: axviBelow?.y?.filter(value => Number.isFinite(Number(value))).length || 0,
+            axviAboveColour: axviAbove?.line?.color || null,
+            axviBelowColour: axviBelow?.line?.color || null,
+            axviLineFills: [axviAbove?.fill || null, axviBelow?.fill || null],
+            axviFillCount: axviFillTraces.length,
+            axviFillModes: [...new Set(axviFillTraces.map(trace => trace.fill))],
+            axviFillHasGaps: axviFillTraces.some(trace =>
+              [...(trace.y || [])].some(value => !Number.isFinite(Number(value)))),
+            axviHover: axviCarrier?.hovertemplate || '',
+            adSeries: ad._fullData
+              .filter(trace => [...(trace.y || [])].some(value => Number.isFinite(Number(value))))
+              .map(trace => trace.name),
+            currencyPoints: currency._fullData.find(trace => trace.name === 'XDA')
+              ?.y?.filter(value => Number.isFinite(Number(value))).length || 0,
+            currencySeries: currency._fullData
+              .filter(trace => [...(trace.y || [])].some(value => Number.isFinite(Number(value))))
+              .map(trace => trace.name),
             health: document.querySelector('.stamp')?.textContent || '',
           };
         }
         """
     )
-    assert initial["plots"] == 7 and initial["kpis"] == 6, initial
+    assert initial["plots"] == 10 and initial["kpis"] == 6, initial
     assert initial["methodologyCards"] == 0, initial
     assert initial["controls"] == ["3m", "6m", "1y", "All"], initial
     assert initial["allFinite"] and initial["verticalFixed"], initial
@@ -113,10 +151,43 @@ with sync_playwright() as playwright:
     assert initial["weekendsCompressed"], initial
     assert initial["opaqueHoverCards"], initial
     assert initial["labelledSections"] and initial["chartRoles"], initial
+    assert initial["chartHeadings"][-2:] == [
+        "S&P/ASX 200 VIX (AXVI)",
+        "Australian Dollar Currency Index (XDA)",
+    ], initial
     assert initial["sharedRasiCrossings"] > 0, initial
     assert initial["weekendRasiCrossings"] == 0, initial
     assert initial["visualPoints"] > initial["carrierPoints"], initial
     assert "Oscillator" in initial["carrierHover"], initial
+    assert initial["geometricPoints"] > 0, initial
+    assert "Daily geometric return" in initial["geometricHover"], initial
+    assert set(initial["geometricSeries"]) == {
+        "Geometric index",
+        "19-session EMA",
+        "39-session EMA",
+        "200-session EMA",
+    }, initial
+    assert initial["axviAbovePoints"] > 0 and initial["axviBelowPoints"] > 0, initial
+    assert initial["axviAboveColour"] == "#b84b45", initial
+    assert initial["axviBelowColour"] == "#111111", initial
+    assert initial["axviLineFills"] == ["none", "none"], initial
+    assert initial["axviFillCount"] > 2, initial
+    assert initial["axviFillModes"] == ["toself"], initial
+    assert not initial["axviFillHasGaps"], initial
+    assert "200-session EMA" in initial["axviHover"], initial
+    assert set(initial["adSeries"]) == {
+        "Cumulative A/D",
+        "19-session EMA",
+        "39-session EMA",
+        "200-session EMA",
+    }, initial
+    assert initial["currencyPoints"] > 0, initial
+    assert set(initial["currencySeries"]) == {
+        "XDA",
+        "19-session EMA",
+        "39-session EMA",
+        "200-session EMA",
+    }, initial
     assert "Cached through" in initial["health"], initial
 
     # Native buttons are keyboard-operable and update every chart through one
