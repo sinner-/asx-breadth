@@ -50,6 +50,16 @@ def parser() -> argparse.ArgumentParser:
         default="VAS.AX",
         help="Yahoo symbol for the total-return card (default: %(default)s)",
     )
+    result.add_argument(
+        "--volatility-symbol",
+        default="^AXVI",
+        help="Yahoo symbol for the S&P/ASX 200 VIX card (default: %(default)s)",
+    )
+    result.add_argument(
+        "--currency-index-symbol",
+        default="^XDA",
+        help="Yahoo symbol for the Australian Dollar Currency Index card (default: %(default)s)",
+    )
     result.add_argument("--lookback-sessions", type=int, default=1000)
     result.add_argument(
         "--as-of-date",
@@ -132,6 +142,20 @@ def main(argv: Sequence[str] | None = None) -> int:
                 universe_name=arguments.universe_name,
                 benchmark_symbol=arguments.benchmark_symbol,
             )
+            snapshot = database.register_universe_series(
+                snapshot.snapshot_id,
+                role="volatility",
+                provider_symbol=arguments.volatility_symbol,
+                local_symbol=".AXVI",
+                name="S&P/ASX 200 VIX",
+            )
+            snapshot = database.register_universe_series(
+                snapshot.snapshot_id,
+                role="currency_index",
+                provider_symbol=arguments.currency_index_symbol,
+                local_symbol="XDA",
+                name="Australian Dollar Currency Index",
+            )
         except ValueError as exc:
             # Hard temporal/source-identity invariants remain non-bypassable.
             logging.error("Cannot import holdings: %s", exc)
@@ -164,6 +188,16 @@ def main(argv: Sequence[str] | None = None) -> int:
         benchmark_anchor_price = database.latest_adjusted_close(
             snapshot.benchmark.instrument_id if snapshot.benchmark else None
         )
+        series_factors = {
+            series.role: database.factors_for_instrument(
+                series.instrument.instrument_id
+            )
+            for series in snapshot.auxiliary_series
+        }
+        series_anchor_prices = {
+            series.role: database.latest_adjusted_close(series.instrument.instrument_id)
+            for series in snapshot.auxiliary_series
+        }
         results = run_indicators(
             IndicatorContext(
                 snapshot=snapshot,
@@ -171,6 +205,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                 benchmark_factors=benchmark_factors,
                 benchmark_anchor_price=benchmark_anchor_price,
                 membership=membership,
+                series_factors=series_factors,
+                series_anchor_prices=series_anchor_prices,
             ),
             BUILT_IN_INDICATORS,
         )

@@ -68,6 +68,220 @@ class BenchmarkTrendPanel:
         return _style(figure, "Adjusted price (AUD)")
 
 
+class GeometricIndexPanel:
+    key = "geometric-index-chart"
+    indicator_key = "geometric_index"
+    title = "ASX 300 Geometric Index"
+
+    def figure(self, result: IndicatorResult) -> go.Figure:
+        frame = result.frame
+        figure = go.Figure()
+        figure.add_hline(y=100, line_width=1, line_color="rgba(22, 33, 29, 0.22)")
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame["geometric_ema200"],
+                name="200-session EMA",
+                mode="lines",
+                line={"color": "rgba(22, 33, 29, 0.55)", "width": 1.4},
+                hovertemplate="<b>200-session EMA</b>: %{y:.2f}<extra></extra>",
+            )
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame["geometric_index"],
+                name="Geometric index",
+                mode="lines",
+                line={"color": COLORS["ink"], "width": 2.2},
+                customdata=frame[
+                    [
+                        "daily_geometric_return",
+                        "quoted_issues",
+                        "active_issues",
+                        "coverage",
+                        "coverage_floor",
+                        "quality_ok",
+                    ]
+                ],
+                hovertemplate=(
+                    "<b>Geometric index</b>: %{y:.2f}<br>"
+                    "Daily geometric return: %{customdata[0]:+.2%}<br>"
+                    "Quotes: %{customdata[1]:.0f} / %{customdata[2]:.0f}<br>"
+                    "Coverage: %{customdata[3]:.1%}<br>"
+                    "Quality floor: %{customdata[4]:.1%}<br>"
+                    "Quality accepted: %{customdata[5]}<extra></extra>"
+                ),
+            )
+        )
+        for column, label, colour in (
+            ("geometric_ema19", "19-session EMA", COLORS["gold"]),
+            ("geometric_ema39", "39-session EMA", COLORS["blue"]),
+        ):
+            figure.add_trace(
+                go.Scatter(
+                    x=frame.index,
+                    y=frame[column],
+                    name=label,
+                    mode="lines",
+                    line={"color": colour, "width": 1.4},
+                    hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
+                )
+            )
+        return _style(figure, "Geometric total-return index (base 100)")
+
+
+class CurrencyIndexTrendPanel:
+    key = "currency-index-trend-chart"
+    indicator_key = "currency_index_trend"
+    title = "Australian Dollar Currency Index (XDA)"
+
+    def figure(self, result: IndicatorResult) -> go.Figure:
+        frame = result.frame
+        figure = go.Figure()
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame["currency_index_ema200"],
+                name="200-session EMA",
+                mode="lines",
+                line={"color": "rgba(22, 33, 29, 0.55)", "width": 1.4},
+                hovertemplate="<b>200-session EMA</b>: %{y:.2f}<extra></extra>",
+            )
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame["currency_index"],
+                name="XDA",
+                mode="lines",
+                line={"color": COLORS["ink"], "width": 2.2},
+                hovertemplate="<b>XDA</b>: %{y:.2f}<extra></extra>",
+            )
+        )
+        for column, label, colour in (
+            ("currency_index_ema19", "19-session EMA", COLORS["gold"]),
+            ("currency_index_ema39", "39-session EMA", COLORS["blue"]),
+        ):
+            figure.add_trace(
+                go.Scatter(
+                    x=frame.index,
+                    y=frame[column],
+                    name=label,
+                    mode="lines",
+                    line={"color": colour, "width": 1.4},
+                    hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
+                )
+            )
+        return _style(figure, "Currency index level")
+
+
+class VolatilityTrendPanel:
+    key = "volatility-trend-chart"
+    indicator_key = "volatility_trend"
+    title = "S&P/ASX 200 VIX (AXVI)"
+
+    def figure(self, result: IndicatorResult) -> go.Figure:
+        frame = result.frame.dropna(subset=["axvi", "axvi_ema200"])
+        figure = go.Figure()
+        if frame.empty:
+            return _style(figure, "Volatility index level")
+
+        above, below, above_ema, below_ema = _ema_regime_paths(frame)
+        regimes = (
+            (
+                above,
+                above_ema,
+                "AXVI above EMA",
+                COLORS["red"],
+                "rgba(184, 75, 69, 0.18)",
+            ),
+            (
+                below,
+                below_ema,
+                "AXVI below EMA",
+                "#111111",
+                "rgba(17, 17, 17, 0.14)",
+            ),
+        )
+        # Plotly's `tonexty` fill closes across NaN-separated runs and can
+        # bridge unrelated regimes. Render each contiguous regime as its own
+        # closed AXVI-to-EMA polygon so fills stop exactly at both crossings.
+        for values, baseline, name, _colour, fillcolour in regimes:
+            for number, (polygon_x, polygon_y) in enumerate(
+                _regime_fill_polygons(values, baseline),
+                start=1,
+            ):
+                figure.add_trace(
+                    go.Scatter(
+                        x=polygon_x,
+                        y=polygon_y,
+                        name=f"{name} fill {number}",
+                        mode="lines",
+                        line={"color": "rgba(0,0,0,0)", "width": 0},
+                        fill="toself",
+                        fillcolor=fillcolour,
+                        hoverinfo="skip",
+                        showlegend=False,
+                        meta={"external_legend": False},
+                    )
+                )
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame["axvi_ema200"],
+                name="200-session EMA",
+                mode="lines",
+                line={"color": "rgba(22, 33, 29, 0.50)", "width": 1.5},
+                hoverinfo="skip",
+            )
+        )
+        for values, _baseline, name, colour, _fillcolour in regimes:
+            figure.add_trace(
+                go.Scatter(
+                    x=values.index,
+                    y=values,
+                    name=name,
+                    mode="lines",
+                    line={"color": colour, "width": 2.4},
+                    hoverinfo="skip",
+                    connectgaps=False,
+                )
+            )
+
+        relation = np.where(
+            frame["axvi"] > frame["axvi_ema200"],
+            "Above 200-session EMA",
+            np.where(
+                frame["axvi"] < frame["axvi_ema200"],
+                "Below 200-session EMA",
+                "At 200-session EMA",
+            ),
+        )
+        customdata = np.column_stack(
+            (frame["axvi_ema200"], frame["axvi"] - frame["axvi_ema200"], relation)
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame["axvi"],
+                name="AXVI",
+                mode="markers",
+                marker={"color": "rgba(0,0,0,0)", "size": 10},
+                customdata=customdata,
+                hovertemplate=(
+                    "<b>AXVI</b>: %{y:.2f}<br>"
+                    "200-session EMA: %{customdata[0]:.2f}<br>"
+                    "Spread: %{customdata[1]:+.2f}<br>"
+                    "%{customdata[2]}<extra></extra>"
+                ),
+                showlegend=False,
+                meta={"external_legend": False},
+            )
+        )
+        return _style(figure, "Volatility index level")
+
+
 class AdvanceDeclinePanel:
     key = "ad-chart"
     indicator_key = "advance_decline"
@@ -80,6 +294,13 @@ class AdvanceDeclinePanel:
             ("cumulative_ad", "Cumulative A/D", COLORS["green"], 2.7, True),
             ("cumulative_ad_ema19", "19-session EMA", COLORS["gold"], 1.8, False),
             ("cumulative_ad_ema39", "39-session EMA", COLORS["blue"], 1.8, False),
+            (
+                "cumulative_ad_ema200",
+                "200-session EMA",
+                "rgba(22, 33, 29, 0.55)",
+                1.5,
+                False,
+            ),
         )
         for column, label, colour, width, show_breadth in traces:
             hover = f"<b>{label}</b>: %{{y:.2f}}"
@@ -443,6 +664,108 @@ def _signed_rasi_paths(frame: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         pd.Series(positive, index=index, dtype=float),
         pd.Series(negative, index=index, dtype=float),
     )
+
+
+def _ema_regime_paths(
+    frame: pd.DataFrame,
+) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series]:
+    """Split AXVI/EMA paths with both regimes meeting at exact crossovers."""
+    dates: list[pd.Timestamp] = []
+    above: list[float] = []
+    below: list[float] = []
+    above_ema: list[float] = []
+    below_ema: list[float] = []
+    previous_date: pd.Timestamp | None = None
+    previous_level: float | None = None
+    previous_ema: float | None = None
+    previous_difference: float | None = None
+
+    for raw_date, row in frame[["axvi", "axvi_ema200"]].iterrows():
+        trade_date = pd.Timestamp(raw_date)
+        level = float(row["axvi"])
+        ema = float(row["axvi_ema200"])
+        difference = level - ema
+        if (
+            previous_date is not None
+            and previous_level is not None
+            and previous_ema is not None
+            and previous_difference is not None
+            and previous_difference * difference < 0
+        ):
+            fraction = abs(previous_difference) / (
+                abs(previous_difference) + abs(difference)
+            )
+            crossing_date = _interpolate_without_weekends(
+                previous_date,
+                trade_date,
+                fraction,
+            )
+            crossing_level = previous_level + (level - previous_level) * fraction
+            crossing_ema = previous_ema + (ema - previous_ema) * fraction
+            crossing = (crossing_level + crossing_ema) / 2.0
+            dates.append(crossing_date)
+            above.append(crossing)
+            below.append(crossing)
+            above_ema.append(crossing)
+            below_ema.append(crossing)
+
+        dates.append(trade_date)
+        if difference > 0:
+            above.append(level)
+            above_ema.append(ema)
+            below.append(np.nan)
+            below_ema.append(np.nan)
+        elif difference < 0:
+            above.append(np.nan)
+            above_ema.append(np.nan)
+            below.append(level)
+            below_ema.append(ema)
+        else:
+            above.append(level)
+            above_ema.append(ema)
+            below.append(level)
+            below_ema.append(ema)
+        previous_date = trade_date
+        previous_level = level
+        previous_ema = ema
+        previous_difference = difference
+
+    index = pd.DatetimeIndex(dates)
+    return (
+        pd.Series(above, index=index, dtype=float),
+        pd.Series(below, index=index, dtype=float),
+        pd.Series(above_ema, index=index, dtype=float),
+        pd.Series(below_ema, index=index, dtype=float),
+    )
+
+
+def _regime_fill_polygons(
+    values: pd.Series,
+    baseline: pd.Series,
+) -> list[tuple[list[pd.Timestamp], list[float]]]:
+    """Close each finite regime run against its matching EMA path."""
+    aligned = pd.DataFrame({"value": values, "baseline": baseline})
+    valid = aligned["value"].notna() & aligned["baseline"].notna()
+    polygons: list[tuple[list[pd.Timestamp], list[float]]] = []
+    start: int | None = None
+    for position, is_valid in enumerate(valid.tolist() + [False]):
+        if is_valid and start is None:
+            start = position
+            continue
+        if is_valid or start is None:
+            continue
+        run = aligned.iloc[start:position]
+        start = None
+        if len(run) < 2:
+            continue
+        run_dates = [pd.Timestamp(item) for item in run.index]
+        polygon_x = [*run_dates, *reversed(run_dates)]
+        polygon_y = [
+            *run["value"].astype(float).tolist(),
+            *reversed(run["baseline"].astype(float).tolist()),
+        ]
+        polygons.append((polygon_x, polygon_y))
+    return polygons
 
 
 def _interpolate_without_weekends(

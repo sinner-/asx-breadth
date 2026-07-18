@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 import pandas as pd
 
@@ -17,6 +17,8 @@ class IndicatorContext:
     benchmark_factors: pd.DataFrame = field(default_factory=pd.DataFrame)
     benchmark_anchor_price: float | None = None
     membership: pd.DataFrame = field(default_factory=pd.DataFrame)
+    series_factors: Mapping[str, pd.DataFrame] = field(default_factory=dict)
+    series_anchor_prices: Mapping[str, float | None] = field(default_factory=dict)
 
 
 @dataclass(frozen=True, slots=True)

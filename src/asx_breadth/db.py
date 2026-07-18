@@ -13,7 +13,13 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
-from .models import HoldingsFile, Snapshot, SnapshotInstrument, SyncTarget
+from .models import (
+    HoldingsFile,
+    Snapshot,
+    SnapshotInstrument,
+    SnapshotSeries,
+    SyncTarget,
+)
 
 
 SCHEMA_VERSION = 2
@@ -684,6 +690,16 @@ class Database:
             if benchmark_row is not None
             else None
         )
+        auxiliary_rows = self.connection.execute(
+            """
+            SELECT us.role, i.id, i.local_symbol, i.provider_symbol, i.name
+            FROM universe_series us
+            JOIN instruments i ON i.id = us.instrument_id
+            WHERE us.universe_id = ? AND us.role <> 'benchmark'
+            ORDER BY us.role
+            """,
+            (row["universe_id"],),
+        ).fetchall()
         return Snapshot(
             snapshot_id=row["id"],
             universe_code=row["code"],
@@ -700,7 +716,89 @@ class Database:
                 for item in instruments
             ),
             benchmark=benchmark,
+            auxiliary_series=tuple(
+                SnapshotSeries(
+                    role=item["role"],
+                    instrument=SnapshotInstrument(
+                        instrument_id=item["id"],
+                        local_symbol=item["local_symbol"],
+                        provider_symbol=item["provider_symbol"],
+                        name=item["name"],
+                    ),
+                )
+                for item in auxiliary_rows
+            ),
         )
+
+    def register_universe_series(
+        self,
+        snapshot_id: int,
+        *,
+        role: str,
+        provider_symbol: str,
+        local_symbol: str,
+        name: str,
+    ) -> Snapshot:
+        """Attach a cached non-constituent series to a snapshot's universe.
+
+        Series configuration belongs to the universe rather than a holdings
+        snapshot. Re-registering a role is idempotent and makes a symbol change
+        explicit without altering any historical composition evidence.
+        """
+        normalised_role = role.strip().lower()
+        if (
+            not normalised_role
+            or not normalised_role[0].isalpha()
+            or not normalised_role.replace("_", "").isalnum()
+        ):
+            raise ValueError(f"Invalid universe-series role: {role!r}")
+        symbol = provider_symbol.strip().upper()
+        local = local_symbol.strip().upper()
+        series_name = name.strip()
+        if not symbol or not local or not series_name:
+            raise ValueError(
+                "Universe-series symbol, local symbol, and name are required"
+            )
+
+        with self.transaction() as connection:
+            universe = connection.execute(
+                """
+                SELECT s.universe_id
+                FROM universe_snapshots s
+                WHERE s.id = ?
+                """,
+                (snapshot_id,),
+            ).fetchone()
+            if universe is None:
+                raise ValueError(f"Unknown universe snapshot: {snapshot_id}")
+            connection.execute(
+                """
+                INSERT INTO instruments
+                    (exchange, local_symbol, provider, provider_symbol, name)
+                VALUES ('ASX', ?, 'yahoo', ?, ?)
+                ON CONFLICT (provider, provider_symbol) DO UPDATE SET
+                    local_symbol = excluded.local_symbol,
+                    name = excluded.name
+                """,
+                (local, symbol, series_name),
+            )
+            instrument_id = connection.execute(
+                """
+                SELECT id FROM instruments
+                WHERE provider = 'yahoo' AND provider_symbol = ?
+                """,
+                (symbol,),
+            ).fetchone()["id"]
+            connection.execute(
+                """
+                INSERT INTO universe_series (universe_id, instrument_id, role)
+                VALUES (?, ?, ?)
+                ON CONFLICT (universe_id, role) DO UPDATE SET
+                    instrument_id = excluded.instrument_id
+                """,
+                (universe["universe_id"], instrument_id, normalised_role),
+            )
+        return self.snapshot(snapshot_id)
 
     def membership_for_snapshot(self, snapshot_id: int) -> pd.DataFrame:
         """Return effective-dated compositions known by the selected snapshot."""
@@ -748,7 +846,6 @@ class Database:
                 SELECT us.instrument_id, 1 AS active, NULL AS required_end
                 FROM universe_series us
                 JOIN target t ON t.universe_id = us.universe_id
-                WHERE us.role = 'benchmark'
                 UNION ALL
                 SELECT r.instrument_id, 0 AS active, r.required_end
                 FROM sync_requirements r
@@ -1742,10 +1839,13 @@ class Database:
             return None
         row = self.connection.execute(
             """
-            SELECT adjusted_close
-            FROM provider_observations
-            WHERE instrument_id = ? AND adjusted_close IS NOT NULL
-            ORDER BY trade_date DESC, observed_at DESC, id DESC
+            SELECT o.adjusted_close
+            FROM provider_observations o
+            JOIN daily_factors f
+              ON f.instrument_id = o.instrument_id
+             AND f.trade_date = o.trade_date
+            WHERE o.instrument_id = ? AND o.adjusted_close IS NOT NULL
+            ORDER BY f.trade_date DESC, o.observed_at DESC, o.id DESC
             LIMIT 1
             """,
             (instrument_id,),

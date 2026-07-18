@@ -25,6 +25,7 @@ OUTPUT_COLUMNS = [
     "cumulative_ad",
     "cumulative_ad_ema19",
     "cumulative_ad_ema39",
+    "cumulative_ad_ema200",
     "net_advances_ema19",
     "net_advances_ema39",
 ]
@@ -96,12 +97,12 @@ class AdvanceDecline:
         raw_net_advances = frame["advances"] - frame["declines"]
         frame["net_advances"] = raw_net_advances.where(frame["quality_ok"])
         frame["cumulative_ad"] = frame["net_advances"].fillna(0).cumsum()
-        frame["cumulative_ad_ema19"] = (
-            frame["cumulative_ad"].ewm(span=19, adjust=False, min_periods=19).mean()
-        )
-        frame["cumulative_ad_ema39"] = (
-            frame["cumulative_ad"].ewm(span=39, adjust=False, min_periods=39).mean()
-        )
+        for span in (19, 39, 200):
+            frame[f"cumulative_ad_ema{span}"] = (
+                frame["cumulative_ad"]
+                .ewm(span=span, adjust=False, min_periods=span)
+                .mean()
+            )
         frame["net_advances_ema19"] = (
             frame["net_advances"].ewm(span=19, adjust=False, min_periods=19).mean()
         )

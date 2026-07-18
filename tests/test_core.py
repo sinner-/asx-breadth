@@ -17,6 +17,7 @@ import tempfile
 import unittest
 from datetime import UTC, date, datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 from openpyxl import Workbook
@@ -31,9 +32,12 @@ from asx_breadth.holdings import parse_holdings  # noqa: E402
 from asx_breadth.indicators import (  # noqa: E402
     AdvanceDecline,
     BenchmarkTrend,
+    CurrencyIndexTrend,
+    GeometricIndex,
     IndicatorContext,
     IndicatorResult,
     RatioAdjustedMcClellan,
+    VolatilityTrend,
     run_indicators,
 )
 from asx_breadth.indicators.new_highs_lows import NewHighLow  # noqa: E402
@@ -42,14 +46,18 @@ from asx_breadth.models import (  # noqa: E402
     HoldingsFile,
     Snapshot,
     SnapshotInstrument,
+    SnapshotSeries,
     SyncOptions,
     SyncTarget,
 )
 from asx_breadth.panels.charts import (  # noqa: E402
     AdvanceDeclinePanel,
+    CurrencyIndexTrendPanel,
+    VolatilityTrendPanel,
+    _ema_regime_paths,
     _signed_rasi_paths,
 )
-from asx_breadth.providers.yahoo import _normalise  # noqa: E402
+from asx_breadth.providers.yahoo import YahooProvider, _normalise  # noqa: E402
 from asx_breadth.sync import synchronise  # noqa: E402
 
 
@@ -261,6 +269,29 @@ class FactorCacheTests(unittest.TestCase):
             finally:
                 database.close()
 
+    @patch("asx_breadth.providers.yahoo.yf.download")
+    def test_yahoo_retries_an_empty_index_without_repair(
+        self, download: object
+    ) -> None:
+        valid = _frame(
+            ["2026-07-16", "2026-07-17"],
+            close=[71.8, 72.3],
+            adjusted=[71.8, 72.3],
+        )
+        download.side_effect = [pd.DataFrame(), valid]
+
+        result = YahooProvider().fetch(
+            ["^XDA"],
+            start=date(2026, 7, 1),
+            end=date(2026, 7, 18),
+            threads=1,
+            timeout=30,
+        )
+
+        self.assertEqual(len(result["^XDA"]), 2)
+        self.assertTrue(download.call_args_list[0].kwargs["repair"])
+        self.assertFalse(download.call_args_list[1].kwargs["repair"])
+
     def test_overlap_correction_revises_canonical_factors_with_audit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "cache.sqlite3")
@@ -370,6 +401,49 @@ class FactorCacheTests(unittest.TestCase):
 
 
 class MembershipRepositoryTests(unittest.TestCase):
+    def test_auxiliary_series_is_registered_idempotently_and_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "cache.sqlite3")
+            try:
+                snapshot = database.import_snapshot(
+                    _holdings_file(date(2026, 7, 1), "first", ("AAA",)),
+                    universe_code="VAS",
+                    universe_name="VAS",
+                    benchmark_symbol="VAS.AX",
+                )
+                registered = database.register_universe_series(
+                    snapshot.snapshot_id,
+                    role="volatility",
+                    provider_symbol="^AXVI",
+                    local_symbol=".AXVI",
+                    name="S&P/ASX 200 VIX",
+                )
+                repeated = database.register_universe_series(
+                    snapshot.snapshot_id,
+                    role="volatility",
+                    provider_symbol="^AXVI",
+                    local_symbol=".AXVI",
+                    name="S&P/ASX 200 VIX",
+                )
+
+                volatility = repeated.instrument_for_role("volatility")
+                target_symbols = {
+                    target.instrument.provider_symbol
+                    for target in database.sync_targets_for_snapshot(
+                        snapshot.snapshot_id
+                    )
+                }
+                self.assertIsNotNone(volatility)
+                self.assertEqual(volatility.provider_symbol, "^AXVI")
+                self.assertEqual(registered.auxiliary_series, repeated.auxiliary_series)
+                self.assertEqual(target_symbols, {"AAA.AX", "VAS.AX", "^AXVI"})
+                self.assertEqual(
+                    [item.provider_symbol for item in repeated.all_instruments],
+                    ["AAA.AX", "VAS.AX", "^AXVI"],
+                )
+            finally:
+                database.close()
+
     def test_preserves_dated_compositions_and_syncs_transition_baskets(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database = Database(Path(directory) / "cache.sqlite3")
@@ -525,6 +599,96 @@ class IndicatorTests(unittest.TestCase):
             ),
         )
 
+    def test_geometric_index_uses_equal_dollar_total_returns_and_skips_gaps(
+        self,
+    ) -> None:
+        dates = pd.date_range("2026-07-01", periods=4, freq="D")
+        factors = pd.DataFrame(
+            [
+                (1, dates[0], pd.NaT, None, None),
+                (1, dates[1], dates[0], 1.21, 1.44),
+                (1, dates[2], dates[1], 1.10, 1.10),
+                (1, dates[3], dates[2], 1.00, 1.00),
+                (2, dates[0], pd.NaT, None, None),
+                (2, dates[1], dates[0], 0.81, 0.64),
+                (2, dates[3], dates[1], 2.00, 2.00),
+            ],
+            columns=[
+                "instrument_id",
+                "trade_date",
+                "previous_trade_date",
+                "close_to_previous_close",
+                "total_return_factor",
+            ],
+        )
+
+        result = GeometricIndex().calculate(
+            IndicatorContext(
+                self.snapshot,
+                factors,
+                benchmark_factors=pd.DataFrame({"trade_date": dates}),
+            ),
+            {},
+        )
+
+        self.assertAlmostEqual(result.frame.iloc[0]["daily_geometric_factor"], 0.96)
+        self.assertAlmostEqual(result.frame.iloc[0]["geometric_index"], 96.0)
+        self.assertAlmostEqual(result.frame.iloc[1]["geometric_index"], 105.6)
+        self.assertAlmostEqual(result.frame.iloc[2]["geometric_index"], 105.6)
+        self.assertEqual(result.frame.iloc[2]["quoted_issues"], 1)
+        self.assertIn("cash dividends", result.metadata["return_basis"])
+
+    def test_geometric_index_accepts_a_halt_but_holds_on_broad_data_loss(self) -> None:
+        dates = pd.date_range("2026-07-01", periods=3, freq="D")
+        instruments = tuple(
+            SnapshotInstrument(index, f"S{index}", f"S{index}.AX", f"Stock {index}")
+            for index in range(1, 26)
+        )
+        snapshot = Snapshot(
+            snapshot_id=2,
+            universe_code="VAS",
+            universe_name="VAS",
+            as_of_date=date(2026, 6, 30),
+            source_path="holdings.xlsx",
+            instruments=instruments,
+        )
+        rows = []
+        for instrument in instruments:
+            rows.append((instrument.instrument_id, dates[0], pd.NaT, None))
+            if instrument.instrument_id <= 24:
+                rows.append((instrument.instrument_id, dates[1], dates[0], 1.01))
+            if instrument.instrument_id <= 5:
+                rows.append((instrument.instrument_id, dates[2], dates[1], 1.02))
+        factors = pd.DataFrame(
+            rows,
+            columns=[
+                "instrument_id",
+                "trade_date",
+                "previous_trade_date",
+                "total_return_factor",
+            ],
+        )
+
+        frame = (
+            GeometricIndex()
+            .calculate(
+                IndicatorContext(
+                    snapshot,
+                    factors,
+                    benchmark_factors=pd.DataFrame({"trade_date": dates}),
+                ),
+                {},
+            )
+            .frame
+        )
+
+        self.assertTrue(frame.iloc[0]["quality_ok"])
+        self.assertEqual(frame.iloc[0]["quoted_issues"], 24)
+        self.assertAlmostEqual(frame.iloc[0]["geometric_index"], 101.0)
+        self.assertFalse(frame.iloc[1]["quality_ok"])
+        self.assertTrue(pd.isna(frame.iloc[1]["daily_geometric_factor"]))
+        self.assertAlmostEqual(frame.iloc[1]["geometric_index"], 101.0)
+
     def test_ad_excludes_resume_after_missing_session(self) -> None:
         factors = pd.DataFrame(
             [
@@ -617,6 +781,37 @@ class IndicatorTests(unittest.TestCase):
         self.assertEqual(result["cumulative_ad"].tolist(), [0, 2, 0, -2])
         self.assertTrue((result["coverage"] == 1.0).all())
 
+    def test_cumulative_ad_includes_a_200_session_ema(self) -> None:
+        dates = pd.bdate_range("2025-09-01", periods=205)
+        rows = []
+        for instrument_id, factor in ((1, 1.01), (2, 1.0)):
+            for position, trade_date in enumerate(dates):
+                rows.append(
+                    {
+                        "instrument_id": instrument_id,
+                        "trade_date": trade_date,
+                        "previous_trade_date": (
+                            dates[position - 1] if position else pd.NaT
+                        ),
+                        "total_return_factor": factor if position else None,
+                    }
+                )
+        result = AdvanceDecline().calculate(
+            IndicatorContext(
+                self.snapshot,
+                pd.DataFrame(rows),
+                benchmark_factors=pd.DataFrame({"trade_date": dates}),
+            ),
+            {},
+        )
+
+        self.assertTrue(result.frame["cumulative_ad_ema200"].iloc[:199].isna().all())
+        self.assertTrue(pd.notna(result.frame["cumulative_ad_ema200"].iloc[199]))
+        self.assertLess(
+            result.frame["cumulative_ad_ema200"].iloc[-1],
+            result.frame["cumulative_ad"].iloc[-1],
+        )
+
     def test_ad_uses_benchmark_calendar_not_anomalous_constituent_date(self) -> None:
         benchmark_dates = pd.to_datetime(["2026-07-03", "2026-07-06", "2026-07-07"])
         factors = pd.DataFrame(
@@ -670,6 +865,7 @@ class IndicatorTests(unittest.TestCase):
                 "cumulative_ad": [1],
                 "cumulative_ad_ema19": [1],
                 "cumulative_ad_ema39": [1],
+                "cumulative_ad_ema200": [1],
             },
             index=pd.to_datetime(["2026-07-01"]),
         )
@@ -699,6 +895,52 @@ class IndicatorTests(unittest.TestCase):
         self.assertEqual(shared_zero.weekday(), 4)
         self.assertGreater(shared_zero, pd.Timestamp("2026-07-10"))
         self.assertLess(shared_zero, pd.Timestamp("2026-07-11"))
+
+    def test_axvi_panel_joins_regime_lines_and_shades_to_the_ema(self) -> None:
+        frame = pd.DataFrame(
+            {
+                "axvi": [10.0, 14.0, 8.0],
+                "axvi_ema200": [12.0, 12.0, 12.0],
+                "above_ema200": [False, True, False],
+            },
+            index=pd.to_datetime(["2026-07-10", "2026-07-13", "2026-07-14"]),
+        )
+        above, below, above_ema, below_ema = _ema_regime_paths(frame)
+        shared = above.index[
+            above.notna()
+            & below.reindex(above.index).notna()
+            & (above == below.reindex(above.index))
+        ]
+        result = IndicatorResult(
+            key="volatility_trend",
+            title="AXVI",
+            frame=frame,
+        )
+        figure = VolatilityTrendPanel().figure(result)
+        traces = {trace.name: trace for trace in figure.data}
+
+        self.assertEqual(len(shared), 2)
+        self.assertTrue((above_ema.loc[shared] == below_ema.loc[shared]).all())
+        self.assertTrue(all(timestamp.weekday() < 5 for timestamp in shared))
+        self.assertEqual(traces["AXVI above EMA"].line.color, "#b84b45")
+        self.assertEqual(traces["AXVI below EMA"].line.color, "#111111")
+        above_fills = [
+            trace
+            for trace in figure.data
+            if trace.name.startswith("AXVI above EMA fill")
+        ]
+        below_fills = [
+            trace
+            for trace in figure.data
+            if trace.name.startswith("AXVI below EMA fill")
+        ]
+        self.assertEqual(len(above_fills), 1)
+        self.assertEqual(len(below_fills), 2)
+        self.assertTrue(all(trace.fill == "toself" for trace in above_fills))
+        self.assertTrue(all(trace.fill == "toself" for trace in below_fills))
+        self.assertIsNone(traces["AXVI above EMA"].fill)
+        self.assertIsNone(traces["AXVI below EMA"].fill)
+        self.assertIn("200-session EMA", traces["AXVI"].hovertemplate)
 
     def test_ratio_adjustment_divides_by_advances_plus_declines(self) -> None:
         ad = pd.DataFrame(
@@ -795,6 +1037,94 @@ class IndicatorTests(unittest.TestCase):
         )
         self.assertTrue(result["low_ema200"].isna().all())
         self.assertTrue(result["high_ema200"].isna().all())
+
+    def test_axvi_reconstructs_actual_level_backwards_from_cached_anchor(self) -> None:
+        dates = pd.bdate_range("2025-09-01", periods=205)
+        factors = pd.DataFrame(
+            {
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "total_return_factor": [None, *([1.01] * 204)],
+            }
+        )
+        volatility = SnapshotInstrument(
+            99,
+            ".AXVI",
+            "^AXVI",
+            "S&P/ASX 200 VIX",
+        )
+        snapshot = Snapshot(
+            snapshot_id=1,
+            universe_code="VAS",
+            universe_name="VAS",
+            as_of_date=date(2026, 6, 30),
+            source_path="holdings.xlsx",
+            instruments=(),
+            auxiliary_series=(SnapshotSeries("volatility", volatility),),
+        )
+
+        result = VolatilityTrend().calculate(
+            IndicatorContext(
+                snapshot=snapshot,
+                factors=pd.DataFrame(),
+                series_factors={"volatility": factors},
+                series_anchor_prices={"volatility": 24.5},
+            ),
+            {},
+        )
+
+        self.assertAlmostEqual(result.frame.iloc[-1]["axvi"], 24.5)
+        self.assertAlmostEqual(
+            result.frame.iloc[0]["axvi"],
+            24.5 / (1.01**204),
+        )
+        self.assertTrue(pd.notna(result.frame.iloc[-1]["axvi_ema200"]))
+        self.assertEqual(result.metadata["provider_symbol"], "^AXVI")
+
+    def test_xda_uses_actual_level_with_19_39_and_200_session_emas(self) -> None:
+        dates = pd.bdate_range("2025-09-01", periods=205)
+        factors = pd.DataFrame(
+            {
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "total_return_factor": [None, *([1.001] * 204)],
+            }
+        )
+        currency_index = SnapshotInstrument(
+            100,
+            "XDA",
+            "^XDA",
+            "Australian Dollar Currency Index",
+        )
+        snapshot = Snapshot(
+            snapshot_id=1,
+            universe_code="VAS",
+            universe_name="VAS",
+            as_of_date=date(2026, 6, 30),
+            source_path="holdings.xlsx",
+            instruments=(),
+            auxiliary_series=(SnapshotSeries("currency_index", currency_index),),
+        )
+
+        result = CurrencyIndexTrend().calculate(
+            IndicatorContext(
+                snapshot=snapshot,
+                factors=pd.DataFrame(),
+                series_factors={"currency_index": factors},
+                series_anchor_prices={"currency_index": 72.3},
+            ),
+            {},
+        )
+        figure = CurrencyIndexTrendPanel().figure(result)
+
+        self.assertAlmostEqual(result.frame.iloc[-1]["currency_index"], 72.3)
+        self.assertTrue(pd.notna(result.frame.iloc[-1]["currency_index_ema19"]))
+        self.assertTrue(pd.notna(result.frame.iloc[-1]["currency_index_ema39"]))
+        self.assertTrue(pd.notna(result.frame.iloc[-1]["currency_index_ema200"]))
+        self.assertEqual(
+            {trace.name for trace in figure.data},
+            {"XDA", "19-session EMA", "39-session EMA", "200-session EMA"},
+        )
 
     def test_new_high_low_requires_full_lookback_and_uses_price_extremes(self) -> None:
         rows = []
