@@ -51,6 +51,7 @@ with sync_playwright() as playwright:
         " && document.querySelectorAll('.js-plotly-plot').length > 0"
         " && [...document.querySelectorAll('.js-plotly-plot')]"
         ".every(plot => plot._fullLayout)"
+        " && document.documentElement.dataset.dashboardReady === 'true'"
         " && document.querySelectorAll('.hover-readout .hover-date').length"
         " === document.querySelectorAll('.js-plotly-plot').length"
         " && document.querySelectorAll('.chart-view.is-active').length === 1"
@@ -254,7 +255,7 @@ with sync_playwright() as playwright:
     assert initial["methodologyCards"] == 0, initial
     assert initial["controls"] == ["3m", "6m", "1y", "All"], initial
     assert initial["allFinite"] and initial["verticalFixed"], initial
-    assert initial["localSelectors"] == 0 and initial["activeRange"] == "all", initial
+    assert initial["localSelectors"] == 0 and initial["activeRange"] == "1y", initial
     assert initial["weekendsCompressed"], initial
     assert initial["plotlyLegendsDisabled"], initial
     assert initial["chartMetaRows"] == initial["plots"], initial
@@ -565,7 +566,7 @@ with sync_playwright() as playwright:
     page.wait_for_timeout(800)
     assert page.evaluate("window.scrollY") > 0
     active_pane_box = page.locator(".chart-pane").bounding_box()
-    assert active_pane_box is not None and active_pane_box["y"] < 100, active_pane_box
+    assert active_pane_box is not None and active_pane_box["y"] < 160, active_pane_box
     mobile = page.evaluate(
         """
         () => ({

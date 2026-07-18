@@ -465,7 +465,7 @@ def _range_controls(available: bool) -> str:
         return ""
     buttons = "".join(
         f'<button type="button" data-dashboard-range="{period}" '
-        f'aria-pressed="{str(period == "all").lower()}">{label}</button>'
+        f'aria-pressed="{str(period == "1y").lower()}">{label}</button>'
         for period, label in (("3m", "3m"), ("6m", "6m"), ("1y", "1y"), ("all", "All"))
     )
     return (
@@ -750,9 +750,12 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
   let canonicalRange = null;
   const rangeQueues = new Map();
   const applyLinkedRange = requestedRange => {{
-    if (!requestedRange || requestedRange.some(value => value === null)) return;
+    if (!requestedRange || requestedRange.some(value => value === null)) {{
+      return Promise.resolve();
+    }}
     canonicalRange = requestedRange.slice();
     const generation = ++rangeGeneration;
+    const updates = [];
     for (const id of plotIds) {{
       const target = document.getElementById(id);
       if (!target) continue;
@@ -773,7 +776,9 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
         }});
       }});
       rangeQueues.set(id, update);
+      updates.push(update);
     }}
+    return Promise.allSettled(updates);
   }};
 
   const isProgrammedRange = plot => {{
@@ -878,12 +883,12 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
     const source = plotIds
       .map(id => document.getElementById(id))
       .find(plot => dataBounds(plot));
-    if (!source) return;
+    if (!source) return Promise.resolve();
     const requested = dashboardRange(source, period);
-    if (!requested) return;
+    if (!requested) return Promise.resolve();
     const [start, end] = requested;
     setActiveRange(period);
-    applyLinkedRange([start, end]);
+    return applyLinkedRange([start, end]);
   }};
 
   for (const button of rangeButtons) {{
@@ -999,7 +1004,9 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
     resetHoverReadout(plot);
     scheduleFit();
   }}
-  applyResponsiveLayout();
+  applyResponsiveLayout()
+    .then(() => applyDashboardRange("1y"))
+    .then(() => {{ document.documentElement.dataset.dashboardReady = "true"; }});
   if (typeof compactQuery.addEventListener === "function") {{
     compactQuery.addEventListener("change", applyResponsiveLayout);
   }} else {{

@@ -181,7 +181,7 @@ class WhiteboxMethodologyTests(unittest.TestCase):
         self.assertFalse(result.metadata["latest_signal_updated"])
         self.assertEqual(result.metadata["last_accepted_session"], "2026-07-01")
 
-    def test_breadth_begins_after_first_captured_snapshot(self) -> None:
+    def test_earliest_snapshot_supplies_approximate_prior_membership(self) -> None:
         dates = pd.bdate_range("2026-07-01", periods=6)
         factors = pd.DataFrame(
             {
@@ -208,7 +208,7 @@ class WhiteboxMethodologyTests(unittest.TestCase):
         ad = AdvanceDecline().calculate(context, {}).frame
         geometric = GeometricIndex().calculate(context, {}).frame
 
-        expected = dates[3:]
+        expected = dates[1:]
         self.assertTrue(ad.index.equals(expected))
         self.assertTrue(geometric.index.equals(expected))
         self.assertEqual(ad.iloc[0]["advances"], 1)

@@ -59,14 +59,10 @@ def active_membership_for_sessions(
         )
         - 1
     )
-    # A captured composition cannot describe sessions on or before its "as at"
-    # close.  Do not manufacture point-in-time history by extending the first
-    # snapshot backwards; its constituents become active on the next session.
-    known = positions >= 0
-    sessions = sessions[known]
-    positions = positions[known]
-    if sessions.empty:
-        return pd.DataFrame(columns=columns)
+    # Before the first captured snapshot, use the earliest available basket as
+    # an explicit approximation. Later snapshots still take effect only after
+    # their "as at" close, so subsequent composition changes remain point-in-time.
+    positions = np.clip(positions, 0, len(snapshots) - 1)
     snapshot_ids = snapshots["snapshot_id"].to_numpy()[positions]
     compositions = {
         snapshot_id: group["instrument_id"].astype(int).drop_duplicates().tolist()

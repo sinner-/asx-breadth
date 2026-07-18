@@ -26,7 +26,7 @@ This creates:
 Open the dashboard directly in a browser. The ten compact cards are chart selectors with
 252-session sparklines; selecting one swaps it into the single expanded chart pane. Drag zoom,
 range buttons, and Ctrl/Command + wheel work horizontally on dates and stay linked across
-chart changes. An ordinary wheel keeps
+chart changes. The dashboard opens on the latest year by default. An ordinary wheel keeps
 scrolling the page. Direct vertical zoom is disabled, while each value axis automatically
 refits to the data inside the visible date window. The sticky date buttons above the chart
 are keyboard-operable. The expanded chart has one permanent legend above the plot, with the
@@ -110,9 +110,10 @@ src/asx_breadth/
 Every workbook import is a `universe_snapshot` with an effective holdings date and source
 hash. Passing a later VAS file does not erase the old composition. A holdings list described
 as “as at” a close becomes active on the following VAS session, so additions and removals
-do not rewrite earlier breadth history. Breadth history begins on the first VAS session after
-the earliest captured holdings date; no composition is projected backward into sessions for
-which no point-in-time snapshot exists.
+do not rewrite earlier breadth history. Before the first captured holdings date, the earliest
+available composition is used as an acknowledged approximation so the downloaded price history
+can still produce long-run breadth indicators. Later workbook dates remain point-in-time
+transitions.
 
 Workbook schema validation fails closed before database import when the required holdings
 headers are missing or ambiguous. Column order, unrelated extra columns, a holdings table on
