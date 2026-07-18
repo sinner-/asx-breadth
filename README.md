@@ -23,11 +23,15 @@ This creates:
 - `data/asx_breadth.sqlite3` — the incremental cache
 - `dashboard.html` — a self-contained interactive Plotly dashboard
 
-Open the dashboard directly in a browser. Drag zoom, range buttons, and Ctrl/Command +
-wheel work horizontally on dates and stay linked across the cards. An ordinary wheel keeps
+Open the dashboard directly in a browser. The ten compact cards are chart selectors with
+252-session sparklines; selecting one swaps it into the single expanded chart pane. Drag zoom,
+range buttons, and Ctrl/Command + wheel work horizontally on dates and stay linked across
+chart changes. An ordinary wheel keeps
 scrolling the page. Direct vertical zoom is disabled, while each value axis automatically
-refits to the data inside the visible date window. The native date buttons above the charts
-are keyboard-operable; compact screens use those global controls and concise external legends.
+refits to the data inside the visible date window. The sticky date buttons above the chart
+are keyboard-operable. The expanded chart has one permanent legend above the plot, with the
+latest series values shown in that legend and the date beside it; hovering temporarily updates
+both for the selected session. Holdings and cache status are kept in the footer.
 
 Useful options:
 
@@ -97,17 +101,18 @@ src/asx_breadth/
     mcclellan.py                 ratio-adjusted oscillator and summation
     new_highs_lows.py            52-week highs, lows, and NH-NL
   panels/
-    base.py                      dashboard panel protocol
+    base.py                      dashboard panel and summary protocol
     charts.py                    Plotly VAS trend, A/D, McClellan, and NH-NL cards
+    summary.py                   shared panel summary and quality-state helpers
   dashboard.py                   self-contained HTML composition
 ```
 
 Every workbook import is a `universe_snapshot` with an effective holdings date and source
 hash. Passing a later VAS file does not erase the old composition. A holdings list described
 as “as at” a close becomes active on the following VAS session, so additions and removals
-do not rewrite earlier breadth history. Before the first captured holdings date, the earliest
-available composition supplies the historical universe; later workbook dates remain
-point-in-time transitions.
+do not rewrite earlier breadth history. Breadth history begins on the first VAS session after
+the earliest captured holdings date; no composition is projected backward into sessions for
+which no point-in-time snapshot exists.
 
 Workbook schema validation fails closed before database import when the required holdings
 headers are missing or ambiguous. Column order, unrelated extra columns, a holdings table on
@@ -146,7 +151,8 @@ requires changes to Yahoo synchronisation.
   are not silently called unchanged or treated as a multi-day move.
 - A broad-universe session is withheld from cumulative A/D and McClellan calculations when
   quote coverage is below the greater of 90% or 95% of the trailing 60-session median. Raw
-  counts and the rejected coverage remain visible for diagnosis; the cumulative state holds.
+  counts and the rejected coverage remain visible for diagnosis; cumulative and EMA state
+  hold until the next accepted session.
 - Ratio-adjusted net advances are exactly
   `1000 × (advances - declines) / (advances + declines)`; unchanged issues are
   excluded from this denominator.
@@ -204,6 +210,6 @@ transition syncing, audited factor repair, response-anchor/history validation, b
 session policy, auxiliary-series caching, AXVI level reconstruction, gap/halt and coverage
 policy, RASI state, point-in-time new-high/low eligibility, and horizontal-only chart
 configuration. The committed browser smoke check exercises the generated report's linked
-zoom, native date controls, visible-range y fitting, exact bicolour RASI and AXVI regimes,
-opaque hover cards, responsive legends, viewport changes, and accessibility wiring. It uses
-system Chrome when available; generate `dashboard.html` before running it.
+zoom, sticky date controls, visible-range y fitting, exact bicolour RASI and AXVI regimes,
+external hover readouts, responsive legends, viewport changes, and accessibility wiring. It
+uses system Chrome when available; generate `dashboard.html` before running it.

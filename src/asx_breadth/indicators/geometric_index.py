@@ -78,7 +78,11 @@ class GeometricIndex:
         ].copy()
         valid["log_return_factor"] = np.log(valid["total_return_factor"])
 
-        frame = pd.DataFrame(index=sessions[1:])
+        active_sessions = pd.DatetimeIndex(
+            membership["trade_date"].drop_duplicates().sort_values()
+        )
+        eligible_sessions = sessions[1:][sessions[1:].isin(active_sessions)]
+        frame = pd.DataFrame(index=eligible_sessions)
         frame.index.name = "trade_date"
         grouped = valid.groupby("trade_date").agg(
             mean_log_factor=("log_return_factor", "mean"),
@@ -102,11 +106,10 @@ class GeometricIndex:
         frame["geometric_index"] = (
             frame["daily_geometric_factor"].fillna(1.0).cumprod() * 100.0
         )
+        accepted = frame["quality_ok"] & frame["daily_geometric_factor"].notna()
         for span in (19, 39, 200):
-            frame[f"geometric_ema{span}"] = (
-                frame["geometric_index"]
-                .ewm(span=span, adjust=False, min_periods=span)
-                .mean()
+            frame[f"geometric_ema{span}"] = _accepted_session_ema(
+                frame["geometric_index"], accepted, span=span
             )
 
         accepted = frame.index[
@@ -153,4 +156,23 @@ def _empty_result(context: IndicatorContext) -> IndicatorResult:
             "base_value": 100.0,
             "universe_size": len(context.snapshot.instruments),
         },
+    )
+
+
+def _accepted_session_ema(
+    series: pd.Series,
+    accepted: pd.Series,
+    *,
+    span: int,
+) -> pd.Series:
+    """Advance EMA state only when the session supplied an accepted factor."""
+    return (
+        series.where(accepted)
+        .ewm(
+            span=span,
+            adjust=False,
+            ignore_na=True,
+            min_periods=span,
+        )
+        .mean()
     )

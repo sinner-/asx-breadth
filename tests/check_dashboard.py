@@ -47,9 +47,13 @@ with sync_playwright() as playwright:
     )
     page.goto(html_path.as_uri(), wait_until="load")
     page.wait_for_function(
-        "document.querySelectorAll('.js-plotly-plot').length === 10"
+        "document.querySelectorAll('.chart-selector').length === 10"
+        " && document.querySelectorAll('.js-plotly-plot').length > 0"
         " && [...document.querySelectorAll('.js-plotly-plot')]"
         ".every(plot => plot._fullLayout)"
+        " && document.querySelectorAll('.hover-readout .hover-date').length"
+        " === document.querySelectorAll('.js-plotly-plot').length"
+        " && document.querySelectorAll('.chart-view.is-active').length === 1"
     )
 
     initial = page.evaluate(
@@ -63,9 +67,10 @@ with sync_playwright() as playwright:
           const currency = document.getElementById('plot-currency-index-trend-chart');
           const geometricTrace = geometric._fullData.find(
             trace => trace.name === 'Geometric index');
-          const positive = rasi._fullData.find(trace => trace.name === 'RASI above zero');
-          const negative = rasi._fullData.find(trace => trace.name === 'RASI below zero');
-          const carrier = rasi._fullData.find(trace => trace.name === 'RASI');
+          const rasiData = rasi?._fullData || [];
+          const positive = rasiData.find(trace => trace.name === 'RASI above zero');
+          const negative = rasiData.find(trace => trace.name === 'RASI below zero');
+          const carrier = rasiData.find(trace => trace.name === 'RASI');
           const axviAbove = volatility._fullData.find(
             trace => trace.name === 'AXVI above EMA');
           const axviBelow = volatility._fullData.find(
@@ -73,7 +78,7 @@ with sync_playwright() as playwright:
           const axviCarrier = volatility._fullData.find(trace => trace.name === 'AXVI');
           const axviFillTraces = volatility._fullData.filter(
             trace => trace.name?.startsWith('AXVI ') && trace.name.includes(' EMA fill '));
-          const zeros = trace => new Set(trace.x
+          const zeros = trace => new Set((trace?.x || [])
             .filter((_, index) => Number(trace.y[index]) === 0)
             .map(value => new Date(value).getTime()));
           const positiveZeros = zeros(positive);
@@ -82,9 +87,41 @@ with sync_playwright() as playwright:
             const day = new Date(value).getDay();
             return day === 0 || day === 6;
           });
+          const carrierLast = (carrier?.x?.length || 1) - 1;
           return {
             plots: plots.length,
             kpis: document.querySelectorAll('.kpi').length,
+            kpiLabels: [...document.querySelectorAll('.kpi-label')]
+              .map(label => label.textContent),
+            kpiValues: Object.fromEntries([...document.querySelectorAll('.chart-selector')]
+              .map(card => [card.querySelector('.kpi-label')?.textContent,
+                card.querySelector('strong')?.textContent])),
+            mastheads: document.querySelectorAll('header, h1, .eyebrow').length,
+            footers: document.querySelectorAll('footer').length,
+            footerText: document.querySelector('footer')?.textContent || '',
+            selectorCards: document.querySelectorAll('.chart-selector').length,
+            sparklineCards: document.querySelectorAll('.chart-selector .sparkline').length,
+            sparklinePeriods: [...document.querySelectorAll('.spark-period')]
+              .map(label => label.textContent),
+            sparklinePaths: [...document.querySelectorAll('.sparkline .spark-path')]
+              .filter(path => path.getAttribute('d')?.trim()).length,
+            sparklineColours: Object.fromEntries(
+              [...document.querySelectorAll('.chart-selector')].map(card => [
+                card.querySelector('.kpi-label')?.textContent,
+                [...card.querySelectorAll('.spark-path')]
+                  .map(path => getComputedStyle(path).stroke),
+              ])),
+            chartPanes: document.querySelectorAll('.chart-pane').length,
+            chartViews: document.querySelectorAll('.chart-view').length,
+            activeViews: document.querySelectorAll('.chart-view.is-active').length,
+            pressedSelectors: document.querySelectorAll(
+              '.chart-selector[aria-pressed="true"]').length,
+            maxSelectorHeight: Math.max(...[...document.querySelectorAll('.chart-selector')]
+              .map(card => card.getBoundingClientRect().height)),
+            selectorColumns: new Set([...document.querySelectorAll('.chart-selector')]
+              .map(card => Math.round(card.getBoundingClientRect().x))).size,
+            truncatedSelectorLabels: [...document.querySelectorAll('.kpi-label')]
+              .filter(label => label.scrollWidth > label.clientWidth).length,
             methodologyCards: document.querySelectorAll('.notes').length,
             controls: [...document.querySelectorAll('[data-dashboard-range]')]
               .map(button => button.textContent),
@@ -101,13 +138,40 @@ with sync_playwright() as playwright:
                 // Plotly normalises the input ['sat', 'mon'] to [6, 1].
                 && breakItem.bounds?.[0] === 6
                 && breakItem.bounds?.[1] === 1)),
-            opaqueHoverCards: plots.every(plot =>
-              plot._fullLayout.hoverlabel.bgcolor === '#fffdf8'),
-            labelledSections: [...document.querySelectorAll('.chart-card')].every(section => {
+            plotlyLegendsDisabled: plots.every(plot => plot._fullLayout.showlegend === false),
+            chartMetaRows: document.querySelectorAll('.chart-meta').length,
+            externalLegendRows: document.querySelectorAll('.chart-legend').length,
+            externalReadouts: document.querySelectorAll('.hover-readout').length,
+            legendlessCards: [...document.querySelectorAll('.chart-view:not(.unavailable)')]
+              .filter(card => card.querySelectorAll('.legend-item').length === 0).length,
+            defaultReadouts: plots.map(plot => {
+              const readout = document.getElementById(`hover-${plot.id}`);
+              const meta = readout?.closest('.chart-meta');
+              return {
+                id: plot.id,
+                text: meta?.textContent || '',
+                dates: readout?.querySelectorAll('.hover-date').length || 0,
+                values: [...(meta?.querySelectorAll('.legend-value') || [])]
+                  .filter(value => value.textContent.trim()).length,
+                readoutChildren: readout?.children.length || 0,
+                duplicateSwatches: readout?.querySelectorAll('.legend-swatch').length || 0,
+              };
+            }),
+            defaultRasiReadout: document.getElementById('hover-plot-rasi-chart')
+              ?.textContent || '',
+            defaultRasiMeta: document.getElementById('hover-plot-rasi-chart')
+              ?.closest('.chart-meta')?.textContent || '',
+            latestRasiDate: carrier ? new Intl.DateTimeFormat('en-AU', {
+              day: 'numeric', month: 'short', year: 'numeric'
+            }).format(new Date(carrier.x[carrierLast])) : null,
+            latestRasiValue: carrier ? Number(carrier.y[carrierLast]).toLocaleString('en-AU', {
+              minimumFractionDigits: 2, maximumFractionDigits: 2
+            }) : null,
+            labelledSections: [...document.querySelectorAll('.chart-view')].every(section => {
               const id = section.getAttribute('aria-labelledby');
               return id && document.getElementById(id);
             }),
-            chartHeadings: [...document.querySelectorAll('.chart-card h2')]
+            chartHeadings: [...document.querySelectorAll('.chart-view h2')]
               .map(heading => heading.textContent),
             chartRoles: plots.every(plot => plot.getAttribute('role') === 'group'),
             sharedRasiCrossings: sharedZeros.length,
@@ -138,30 +202,91 @@ with sync_playwright() as playwright:
             currencySeries: currency._fullData
               .filter(trace => [...(trace.y || [])].some(value => Number.isFinite(Number(value))))
               .map(trace => trace.name),
-            health: document.querySelector('.stamp')?.textContent || '',
+            health: document.querySelector('footer')?.textContent || '',
           };
         }
         """
     )
-    assert initial["plots"] == 10 and initial["kpis"] == 6, initial
+    assert 1 <= initial["plots"] <= 10 and initial["kpis"] == 10, initial
+    assert initial["kpiLabels"] == [
+        "VAS total return",
+        "ASX 300 geometric",
+        "Cumulative A/D",
+        "RASI",
+        "McClellan oscillator",
+        "New 52-week highs",
+        "New 52-week lows",
+        "New highs − lows",
+        "AXVI",
+        "XDA",
+    ], initial
+    assert initial["kpiValues"]["New 52-week lows"].endswith(" lows"), initial
+    assert initial["mastheads"] == 0 and initial["footers"] == 1, initial
+    assert "holdings as at" in initial["footerText"], initial
+    assert "Generated" in initial["footerText"], initial
+    assert initial["selectorCards"] == 10, initial
+    assert initial["sparklineCards"] == 10, initial
+    assert initial["sparklinePeriods"] == ["1Y"] * 10, initial
+    assert initial["sparklinePaths"] >= initial["plots"], initial
+    assert initial["sparklineColours"]["ASX 300 geometric"] == ["rgb(22, 33, 29)"], (
+        initial
+    )
+    assert initial["sparklineColours"]["Cumulative A/D"] == ["rgb(20, 125, 100)"], (
+        initial
+    )
+    assert initial["sparklineColours"]["New 52-week highs"] == ["rgb(17, 17, 17)"], (
+        initial
+    )
+    if "plot-rasi-chart" in {item["id"] for item in initial["defaultReadouts"]}:
+        assert set(initial["sparklineColours"]["RASI"]) == {
+            "rgb(20, 125, 100)",
+            "rgb(184, 75, 69)",
+        }, initial
+    assert set(initial["sparklineColours"]["AXVI"]) == {
+        "rgb(17, 17, 17)",
+        "rgb(184, 75, 69)",
+    }, initial
+    assert initial["chartPanes"] == 1 and initial["chartViews"] == 10, initial
+    assert initial["activeViews"] == 1 and initial["pressedSelectors"] == 1, initial
+    assert initial["maxSelectorHeight"] <= 130, initial
+    assert initial["selectorColumns"] == 4, initial
+    assert initial["truncatedSelectorLabels"] == 0, initial
     assert initial["methodologyCards"] == 0, initial
     assert initial["controls"] == ["3m", "6m", "1y", "All"], initial
     assert initial["allFinite"] and initial["verticalFixed"], initial
     assert initial["localSelectors"] == 0 and initial["activeRange"] == "all", initial
     assert initial["weekendsCompressed"], initial
-    assert initial["opaqueHoverCards"], initial
+    assert initial["plotlyLegendsDisabled"], initial
+    assert initial["chartMetaRows"] == initial["plots"], initial
+    assert initial["externalLegendRows"] == initial["plots"], initial
+    assert initial["externalReadouts"] == initial["plots"], initial
+    assert initial["legendlessCards"] == 0, initial
+    assert all(
+        item["dates"] == 1
+        and item["values"] >= 1
+        and item["readoutChildren"] == 1
+        and item["duplicateSwatches"] == 0
+        and "Hover chart for values" not in item["text"]
+        for item in initial["defaultReadouts"]
+    ), initial
+    if initial["latestRasiDate"] is not None:
+        assert initial["latestRasiDate"] in initial["defaultRasiReadout"], initial
+        assert initial["latestRasiValue"] in initial["defaultRasiMeta"], initial
     assert initial["labelledSections"] and initial["chartRoles"], initial
     assert initial["chartHeadings"][-2:] == [
         "S&P/ASX 200 VIX (AXVI)",
         "Australian Dollar Currency Index (XDA)",
     ], initial
-    assert initial["sharedRasiCrossings"] > 0, initial
-    assert initial["weekendRasiCrossings"] == 0, initial
-    assert initial["visualPoints"] > initial["carrierPoints"], initial
-    assert "Oscillator" in initial["carrierHover"], initial
+    if initial["latestRasiDate"] is not None:
+        assert initial["sharedRasiCrossings"] > 0, initial
+        assert initial["weekendRasiCrossings"] == 0, initial
+        assert initial["visualPoints"] > initial["carrierPoints"], initial
+        assert "Oscillator" not in initial["carrierHover"], initial
     assert initial["geometricPoints"] > 0, initial
-    assert "Daily geometric return" in initial["geometricHover"], initial
-    assert set(initial["geometricSeries"]) == {
+    assert "Daily geometric return" not in initial["geometricHover"], initial
+    assert "Coverage" not in initial["geometricHover"], initial
+    assert "Geometric index" in initial["geometricSeries"], initial
+    assert set(initial["geometricSeries"]) <= {
         "Geometric index",
         "19-session EMA",
         "39-session EMA",
@@ -174,8 +299,10 @@ with sync_playwright() as playwright:
     assert initial["axviFillCount"] > 2, initial
     assert initial["axviFillModes"] == ["toself"], initial
     assert not initial["axviFillHasGaps"], initial
-    assert "200-session EMA" in initial["axviHover"], initial
-    assert set(initial["adSeries"]) == {
+    assert "Spread" not in initial["axviHover"], initial
+    assert "Above" not in initial["axviHover"], initial
+    assert "Cumulative A/D" in initial["adSeries"], initial
+    assert set(initial["adSeries"]) <= {
         "Cumulative A/D",
         "19-session EMA",
         "39-session EMA",
@@ -189,6 +316,9 @@ with sync_playwright() as playwright:
         "200-session EMA",
     }, initial
     assert "Cached through" in initial["health"], initial
+    rasi_available = any(
+        item["id"] == "plot-rasi-chart" for item in initial["defaultReadouts"]
+    )
 
     # Native buttons are keyboard-operable and update every chart through one
     # bounded, linked x-range implementation.
@@ -204,16 +334,47 @@ with sync_playwright() as playwright:
         """
     )
     for linked in linked_ranges[1:]:
-        assert abs(linked[0] - linked_ranges[0][0]) < 1_000, linked_ranges
+        # A newer series cannot expose dates before its first honest observation;
+        # it clamps only that left edge while preserving the shared right edge.
+        assert linked[0] >= linked_ranges[0][0] - 1_000, linked_ranges
         assert abs(linked[1] - linked_ranges[0][1]) < 1_000, linked_ranges
 
-    # The one canonical range control must remain accessible while inspecting
-    # charts near the bottom of the report.
-    page.locator("#plot-net-new-highs-chart").scroll_into_view_if_needed()
+    # Rapid range changes are last-action-wins; no in-flight fan-out may drop
+    # the final selection for hidden plots.
+    page.evaluate(
+        """
+        () => {
+          document.querySelector('[data-dashboard-range="3m"]').click();
+          document.querySelector('[data-dashboard-range="all"]').click();
+          document.querySelector('[data-dashboard-range="6m"]').click();
+        }
+        """
+    )
+    page.wait_for_timeout(1200)
+    assert six_months.get_attribute("aria-pressed") == "true"
+    rapid_ranges = page.evaluate(
+        """
+        () => [...document.querySelectorAll('.js-plotly-plot')].map(plot =>
+          plot._fullLayout.xaxis.range.map(value => new Date(value).getTime()))
+        """
+    )
+    for linked in rapid_ranges[1:]:
+        assert linked[0] >= rapid_ranges[0][0] - 1_000, rapid_ranges
+        assert abs(linked[1] - rapid_ranges[0][1]) < 1_000, rapid_ranges
+
+    # The one canonical range control remains accessible while inspecting the
+    # expanded pane and footer.
+    page.locator("footer").scroll_into_view_if_needed()
     page.wait_for_timeout(150)
     sticky_control = page.locator(".range-control").bounding_box()
     assert sticky_control is not None, sticky_control
-    assert 0 <= sticky_control["y"] <= 12, sticky_control
+    assert sticky_control["y"] >= 0, sticky_control
+    assert (
+        page.locator(".range-control").evaluate(
+            "node => getComputedStyle(node).position"
+        )
+        == "sticky"
+    )
     assert (
         sticky_control["y"] + sticky_control["height"] <= page.viewport_size["height"]
     )
@@ -269,7 +430,8 @@ with sync_playwright() as playwright:
 
     # Ordinary wheel input remains page scrolling; only modifier-wheel zoom is
     # captured by the plot.
-    benchmark.scroll_into_view_if_needed()
+    page.evaluate("window.scrollTo(0, 0)")
+    page.wait_for_timeout(100)
     before_x = benchmark.evaluate("plot => plot._fullLayout.xaxis.range.slice()")
     before_scroll = page.evaluate("window.scrollY")
     box = benchmark.locator(".nsewdrag").bounding_box()
@@ -291,27 +453,61 @@ with sync_playwright() as playwright:
     assert before_x == after_x, (before_x, after_x)
     assert page.evaluate("window.scrollY") > before_scroll
 
-    # The transparent real-session carrier supplies one useful unified hover;
-    # interpolated visual crossings intentionally do not create fake sessions.
-    page.evaluate(
-        """
-        () => {
-          const plot = document.getElementById('plot-rasi-chart');
-          const curve = plot._fullData.findIndex(trace => trace.name === 'RASI');
-          Plotly.Fx.hover(plot, [{curveNumber: curve, pointNumber: plot._fullData[curve].x.length - 1}]);
-        }
-        """
-    )
-    page.wait_for_timeout(150)
-    hover_text = page.locator("#plot-rasi-chart .hoverlayer").text_content() or ""
-    assert "RASI" in hover_text and "Oscillator" in hover_text, hover_text
+    if rasi_available:
+        # The transparent real-session carrier supplies one useful external hover;
+        # interpolated visual crossings intentionally do not create fake sessions.
+        rasi_selector = page.locator('[data-plot-id="plot-rasi-chart"]')
+        rasi_selector.focus()
+        page.keyboard.press("Enter")
+        page.wait_for_timeout(450)
+        assert rasi_selector.get_attribute("aria-pressed") == "true"
+        assert page.locator(".chart-view.is-active h2").text_content() == (
+            "McClellan Ratio-Adjusted Summation Index"
+        )
+        rasi_plot = page.locator("#plot-rasi-chart")
+        rasi_plot.scroll_into_view_if_needed()
+        rasi_surface = rasi_plot.locator(".nsewdrag").bounding_box()
+        assert rasi_surface is not None
+        page.mouse.move(
+            rasi_surface["x"] + rasi_surface["width"] * 0.72,
+            rasi_surface["y"] + rasi_surface["height"] * 0.5,
+        )
+        page.wait_for_timeout(150)
+        hover_readout = page.locator("#hover-plot-rasi-chart")
+        hover_text = hover_readout.text_content() or ""
+        hover_meta = hover_readout.locator(
+            "xpath=ancestor::div[contains(@class, 'chart-meta')]"
+        )
+        hover_meta_text = hover_meta.text_content() or ""
+        assert (
+            "RASI" not in hover_text
+            and hover_readout.locator(".legend-swatch").count() == 0
+        )
+        assert "RASI" in hover_meta_text and "Oscillator" not in hover_meta_text
+        assert "EMA" not in hover_meta_text and "Above" not in hover_meta_text
+        page.mouse.move(0, 0)
+        page.wait_for_timeout(150)
+        assert (
+            page.locator("#hover-plot-rasi-chart").text_content()
+            == initial["defaultRasiReadout"]
+        )
+        assert hover_meta.text_content() == initial["defaultRasiMeta"]
 
-    # Physically hover every plot. Unified pointer hovers use an SVG rect while
-    # Plotly.Fx.hover above uses a path, so checking only the layout or the
-    # programmatic route misses the transparency failure seen in the browser.
+    # Physically hover every plot. Values must appear in the permanent row above
+    # the plot and native Plotly hover cards must remain hidden.
     for plot_id in page.locator(".js-plotly-plot").evaluate_all(
         "plots => plots.map(plot => plot.id)"
     ):
+        selector = page.locator(f'[data-plot-id="{plot_id}"]')
+        selector.click()
+        page.wait_for_timeout(250)
+        assert selector.get_attribute("aria-pressed") == "true", plot_id
+        assert page.locator(".chart-selector[aria-pressed='true']").count() == 1
+        assert page.locator(".chart-view.is-active").count() == 1
+        assert (
+            page.locator(".chart-view.is-active .js-plotly-plot").get_attribute("id")
+            == plot_id
+        )
         plot = page.locator(f"#{plot_id}")
         plot.scroll_into_view_if_needed()
         drag_surface = plot.locator(".nsewdrag").bounding_box()
@@ -321,16 +517,38 @@ with sync_playwright() as playwright:
             drag_surface["y"] + drag_surface["height"] * 0.5,
         )
         page.wait_for_timeout(100)
-        hover_background = plot.locator(".hoverlayer rect.bg")
-        assert hover_background.count() == 1, plot_id
-        rendered_background = hover_background.evaluate(
-            "node => ({fill: getComputedStyle(node).fill, "
-            "opacity: getComputedStyle(node).fillOpacity})"
+        readout = page.locator(f"#hover-{plot_id}")
+        readout_text = readout.text_content() or ""
+        chart_meta = readout.locator(
+            "xpath=ancestor::div[contains(@class, 'chart-meta')]"
         )
-        assert rendered_background == {
-            "fill": "rgb(255, 253, 248)",
-            "opacity": "1",
-        }, (plot_id, rendered_background)
+        chart_meta_text = chart_meta.text_content() or ""
+        assert "Hover chart for values" not in readout_text, (plot_id, readout_text)
+        assert readout.locator(".legend-swatch, .hover-value").count() == 0, plot_id
+        assert readout.locator(".hover-date").count() == 1, plot_id
+        assert all(
+            value.strip()
+            for value in chart_meta.locator(".legend-value").all_text_contents()
+        ), (plot_id, chart_meta_text)
+        assert not any(
+            unwanted in chart_meta_text
+            for unwanted in (
+                "Coverage",
+                "Quality",
+                "Eligible",
+                "Spread",
+                "Above 200",
+                "Below 200",
+            )
+        ), (plot_id, readout_text)
+        native_hovers = plot.locator(".hoverlayer .legend, .hoverlayer .hovertext")
+        for index in range(native_hovers.count()):
+            assert (
+                native_hovers.nth(index).evaluate(
+                    "node => getComputedStyle(node).display"
+                )
+                == "none"
+            ), plot_id
 
     # Responsive custom layout must react to orientation/viewport changes, not
     # merely inspect the width once at page load.
@@ -339,16 +557,36 @@ with sync_playwright() as playwright:
         "[...document.querySelectorAll('.js-plotly-plot')]"
         ".every(plot => plot._fullLayout.showlegend === false)"
     )
+    page.evaluate("window.scrollTo(0, 0)")
+    mobile_plot_id = (
+        "plot-rasi-chart" if rasi_available else "plot-benchmark-trend-chart"
+    )
+    page.locator(f'[data-plot-id="{mobile_plot_id}"]').click()
+    page.wait_for_timeout(800)
+    assert page.evaluate("window.scrollY") > 0
+    active_pane_box = page.locator(".chart-pane").bounding_box()
+    assert active_pane_box is not None and active_pane_box["y"] < 100, active_pane_box
     mobile = page.evaluate(
         """
         () => ({
           overflow: document.documentElement.scrollWidth > window.innerWidth,
           visiblePlotlyLegends: [...document.querySelectorAll('.legend')]
             .filter(node => getComputedStyle(node).display !== 'none').length,
-          externalLegends: [...document.querySelectorAll('.mobile-legend')]
+          externalLegends: [...document.querySelectorAll('.chart-view.is-active .chart-legend')]
             .filter(node => getComputedStyle(node).display !== 'none').length,
+          activeViews: document.querySelectorAll('.chart-view.is-active').length,
+          selectorColumns: new Set([...document.querySelectorAll('.chart-selector')]
+            .map(card => Math.round(card.getBoundingClientRect().x))).size,
           selectorVisible: [...document.querySelectorAll('.js-plotly-plot')]
             .some(plot => plot._fullLayout.xaxis.rangeselector.visible !== false),
+          rightmostTickInside: (() => {
+            const pane = document.querySelector('.chart-pane').getBoundingClientRect();
+            const ticks = [...document.querySelectorAll(
+              '.chart-view.is-active .xaxislayer-above .xtick text')];
+            return ticks.length > 0
+              && Math.max(...ticks.map(tick => tick.getBoundingClientRect().right))
+                <= pane.right + 1;
+          })(),
           controlHeights: [...document.querySelectorAll('[data-dashboard-range]')]
             .map(button => button.getBoundingClientRect().height),
         })
@@ -356,26 +594,28 @@ with sync_playwright() as playwright:
     )
     assert not mobile["overflow"] and not mobile["selectorVisible"], mobile
     assert mobile["visiblePlotlyLegends"] == 0, mobile
-    assert mobile["externalLegends"] >= 3, mobile
+    assert mobile["externalLegends"] == 1 and mobile["activeViews"] == 1, mobile
+    assert mobile["selectorColumns"] == 2, mobile
+    assert mobile["rightmostTickInside"], mobile
     assert min(mobile["controlHeights"]) >= 40, mobile
 
     page.set_viewport_size({"width": 900, "height": 800})
     page.wait_for_function(
         "[...document.querySelectorAll('.js-plotly-plot')]"
-        ".some(plot => plot._fullLayout.showlegend === true)"
+        ".every(plot => plot._fullLayout.showlegend === false)"
     )
     restored = page.evaluate(
         """
         () => ({
           plotlyLegends: [...document.querySelectorAll('.legend')]
             .filter(node => getComputedStyle(node).display !== 'none').length,
-          externalLegends: [...document.querySelectorAll('.mobile-legend')]
+          externalLegends: [...document.querySelectorAll('.chart-view.is-active .chart-legend')]
             .filter(node => getComputedStyle(node).display !== 'none').length,
         })
         """
     )
-    assert restored["plotlyLegends"] >= 2, restored
-    assert restored["externalLegends"] == 0, restored
+    assert restored["plotlyLegends"] == 0, restored
+    assert restored["externalLegends"] == 1, restored
     browser.close()
 
 assert not errors, errors

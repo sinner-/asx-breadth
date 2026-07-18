@@ -1,5 +1,6 @@
 """Built-in dashboard panel plugins."""
 
+from .base import DashboardPanel, PanelSummary
 from .charts import (
     AdvanceDeclinePanel,
     BenchmarkTrendPanel,
@@ -31,11 +32,13 @@ __all__ = [
     "AdvanceDeclinePanel",
     "BenchmarkTrendPanel",
     "CurrencyIndexTrendPanel",
+    "DashboardPanel",
     "GeometricIndexPanel",
     "McClellanOscillatorPanel",
     "NetNewHighsPanel",
     "NewHighsPanel",
     "NewLowsPanel",
+    "PanelSummary",
     "RasiPanel",
     "VolatilityTrendPanel",
 ]

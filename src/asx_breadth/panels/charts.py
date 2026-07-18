@@ -7,6 +7,22 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from ..indicators.base import IndicatorResult
+from .base import PanelSummary
+from .summary import (
+    band_state,
+    constituent_share,
+    ema_detail,
+    held_state,
+    is_missing,
+    last_accepted_session,
+    latest_quality,
+    latest_row,
+    number,
+    positive,
+    relative_state,
+    sign_tone,
+    signal_label,
+)
 
 
 COLORS = {
@@ -24,6 +40,26 @@ class BenchmarkTrendPanel:
     key = "benchmark-trend-chart"
     indicator_key = "benchmark_trend"
     title = "VAS Total Return & Hysteresis Band"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        latest = latest_row(result)
+        if latest is None:
+            return PanelSummary("VAS total return", "—", "Unavailable")
+        detail, tone = relative_state(
+            latest["total_return_index"],
+            latest["total_return_ema19"],
+            latest["total_return_ema39"],
+            include_values=True,
+        )
+        band_detail, _ = band_state(
+            latest["total_return_index"], latest["low_ema200"], latest["high_ema200"]
+        )
+        return PanelSummary(
+            "VAS total return",
+            number(latest["total_return_index"], 2),
+            f"{detail} · {band_detail}",
+            tone,
+        )
 
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
@@ -63,6 +99,7 @@ class BenchmarkTrendPanel:
                     mode="lines",
                     line={"color": colour, "width": width},
                     hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
+                    meta={"sparkline": column == "total_return_index"},
                 )
             )
         return _style(figure, "Adjusted price (AUD)")
@@ -72,6 +109,33 @@ class GeometricIndexPanel:
     key = "geometric-index-chart"
     indicator_key = "geometric_index"
     title = "ASX 300 Geometric Index"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        latest = latest_row(result)
+        if latest is None:
+            return PanelSummary("ASX 300 geometric", "—", "Unavailable")
+        _, tone = relative_state(
+            latest["geometric_index"],
+            latest["geometric_ema19"],
+            latest["geometric_ema39"],
+        )
+        detail = ema_detail(
+            latest,
+            (
+                ("geometric_ema19", "EMA19"),
+                ("geometric_ema39", "EMA39"),
+                ("geometric_ema200", "EMA200"),
+            ),
+        )
+        if latest_quality(result, latest) is False:
+            detail = held_state(last_accepted_session(result))
+            tone = "neutral"
+        return PanelSummary(
+            "ASX 300 geometric",
+            number(latest["geometric_index"], 2),
+            detail,
+            tone,
+        )
 
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
@@ -94,24 +158,8 @@ class GeometricIndexPanel:
                 name="Geometric index",
                 mode="lines",
                 line={"color": COLORS["ink"], "width": 2.2},
-                customdata=frame[
-                    [
-                        "daily_geometric_return",
-                        "quoted_issues",
-                        "active_issues",
-                        "coverage",
-                        "coverage_floor",
-                        "quality_ok",
-                    ]
-                ],
-                hovertemplate=(
-                    "<b>Geometric index</b>: %{y:.2f}<br>"
-                    "Daily geometric return: %{customdata[0]:+.2%}<br>"
-                    "Quotes: %{customdata[1]:.0f} / %{customdata[2]:.0f}<br>"
-                    "Coverage: %{customdata[3]:.1%}<br>"
-                    "Quality floor: %{customdata[4]:.1%}<br>"
-                    "Quality accepted: %{customdata[5]}<extra></extra>"
-                ),
+                hovertemplate="<b>Geometric index</b>: %{y:.2f}<extra></extra>",
+                meta={"sparkline": True},
             )
         )
         for column, label, colour in (
@@ -136,6 +184,29 @@ class CurrencyIndexTrendPanel:
     indicator_key = "currency_index_trend"
     title = "Australian Dollar Currency Index (XDA)"
 
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        latest = latest_row(result)
+        if latest is None:
+            return PanelSummary("XDA", "—", "Unavailable")
+        _, tone = relative_state(
+            latest["currency_index"],
+            latest["currency_index_ema19"],
+            latest["currency_index_ema39"],
+        )
+        return PanelSummary(
+            "XDA",
+            number(latest["currency_index"], 2),
+            ema_detail(
+                latest,
+                (
+                    ("currency_index_ema19", "EMA19"),
+                    ("currency_index_ema39", "EMA39"),
+                    ("currency_index_ema200", "EMA200"),
+                ),
+            ),
+            tone,
+        )
+
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
         figure = go.Figure()
@@ -157,6 +228,7 @@ class CurrencyIndexTrendPanel:
                 mode="lines",
                 line={"color": COLORS["ink"], "width": 2.2},
                 hovertemplate="<b>XDA</b>: %{y:.2f}<extra></extra>",
+                meta={"sparkline": True},
             )
         )
         for column, label, colour in (
@@ -180,6 +252,23 @@ class VolatilityTrendPanel:
     key = "volatility-trend-chart"
     indicator_key = "volatility_trend"
     title = "S&P/ASX 200 VIX (AXVI)"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        latest = latest_row(result)
+        if latest is None or is_missing(latest["axvi"]):
+            return PanelSummary("AXVI", "—", "Unavailable")
+        ema = latest["axvi_ema200"]
+        tone = (
+            "negative"
+            if not is_missing(ema) and float(latest["axvi"]) > float(ema)
+            else "ink"
+        )
+        return PanelSummary(
+            "AXVI",
+            number(latest["axvi"], 2),
+            f"EMA200 {number(ema, 2)}",
+            tone,
+        )
 
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame.dropna(subset=["axvi", "axvi_ema200"])
@@ -208,7 +297,7 @@ class VolatilityTrendPanel:
         # bridge unrelated regimes. Render each contiguous regime as its own
         # closed AXVI-to-EMA polygon so fills stop exactly at both crossings.
         for values, baseline, name, _colour, fillcolour in regimes:
-            for number, (polygon_x, polygon_y) in enumerate(
+            for polygon_number, (polygon_x, polygon_y) in enumerate(
                 _regime_fill_polygons(values, baseline),
                 start=1,
             ):
@@ -216,7 +305,7 @@ class VolatilityTrendPanel:
                     go.Scatter(
                         x=polygon_x,
                         y=polygon_y,
-                        name=f"{name} fill {number}",
+                        name=f"{name} fill {polygon_number}",
                         mode="lines",
                         line={"color": "rgba(0,0,0,0)", "width": 0},
                         fill="toself",
@@ -233,7 +322,7 @@ class VolatilityTrendPanel:
                 name="200-session EMA",
                 mode="lines",
                 line={"color": "rgba(22, 33, 29, 0.50)", "width": 1.5},
-                hoverinfo="skip",
+                hovertemplate="<b>200-session EMA</b>: %{y:.2f}<extra></extra>",
             )
         )
         for values, _baseline, name, colour, _fillcolour in regimes:
@@ -246,21 +335,10 @@ class VolatilityTrendPanel:
                     line={"color": colour, "width": 2.4},
                     hoverinfo="skip",
                     connectgaps=False,
+                    meta={"external_legend": False, "sparkline": True},
                 )
             )
 
-        relation = np.where(
-            frame["axvi"] > frame["axvi_ema200"],
-            "Above 200-session EMA",
-            np.where(
-                frame["axvi"] < frame["axvi_ema200"],
-                "Below 200-session EMA",
-                "At 200-session EMA",
-            ),
-        )
-        customdata = np.column_stack(
-            (frame["axvi_ema200"], frame["axvi"] - frame["axvi_ema200"], relation)
-        )
         figure.add_trace(
             go.Scatter(
                 x=frame.index,
@@ -268,15 +346,16 @@ class VolatilityTrendPanel:
                 name="AXVI",
                 mode="markers",
                 marker={"color": "rgba(0,0,0,0)", "size": 10},
-                customdata=customdata,
-                hovertemplate=(
-                    "<b>AXVI</b>: %{y:.2f}<br>"
-                    "200-session EMA: %{customdata[0]:.2f}<br>"
-                    "Spread: %{customdata[1]:+.2f}<br>"
-                    "%{customdata[2]}<extra></extra>"
-                ),
+                hovertemplate="<b>AXVI</b>: %{y:.2f}<extra></extra>",
                 showlegend=False,
-                meta={"external_legend": False},
+                meta={
+                    "external_legend_label": "AXVI",
+                    "external_legend_color": (
+                        "linear-gradient(90deg, #b84b45 0 50%, #111111 50% 100%)"
+                    ),
+                    "external_hover_color": COLORS["ink"],
+                    "sparkline_anchor": True,
+                },
             )
         )
         return _style(figure, "Volatility index level")
@@ -287,45 +366,40 @@ class AdvanceDeclinePanel:
     indicator_key = "advance_decline"
     title = "Cumulative Advance–Decline"
 
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        latest = latest_row(result)
+        if latest is None:
+            return PanelSummary("Cumulative A/D", "—", "Unavailable")
+        detail, tone = relative_state(
+            latest["cumulative_ad"],
+            latest["cumulative_ad_ema19"],
+            latest["cumulative_ad_ema39"],
+        )
+        if latest_quality(result, latest) is False:
+            detail = held_state(last_accepted_session(result))
+            tone = "neutral"
+        return PanelSummary(
+            "Cumulative A/D",
+            number(latest["cumulative_ad"], 0),
+            detail,
+            tone,
+        )
+
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
         figure = go.Figure()
         traces = (
-            ("cumulative_ad", "Cumulative A/D", COLORS["green"], 2.7, True),
-            ("cumulative_ad_ema19", "19-session EMA", COLORS["gold"], 1.8, False),
-            ("cumulative_ad_ema39", "39-session EMA", COLORS["blue"], 1.8, False),
+            ("cumulative_ad", "Cumulative A/D", COLORS["green"], 2.7),
+            ("cumulative_ad_ema19", "19-session EMA", COLORS["gold"], 1.8),
+            ("cumulative_ad_ema39", "39-session EMA", COLORS["blue"], 1.8),
             (
                 "cumulative_ad_ema200",
                 "200-session EMA",
                 "rgba(22, 33, 29, 0.55)",
                 1.5,
-                False,
             ),
         )
-        for column, label, colour, width, show_breadth in traces:
-            hover = f"<b>{label}</b>: %{{y:.2f}}"
-            customdata = None
-            if show_breadth:
-                customdata = frame[
-                    [
-                        "advances",
-                        "declines",
-                        "unchanged",
-                        "advances_plus_declines",
-                        "coverage",
-                        "coverage_floor",
-                        "quality_ok",
-                    ]
-                ]
-                hover += (
-                    "<br>Advances: %{customdata[0]:.0f}"
-                    "<br>Declines: %{customdata[1]:.0f}"
-                    "<br>Unchanged: %{customdata[2]:.0f}"
-                    "<br>A + D: %{customdata[3]:.0f}"
-                    "<br>Coverage: %{customdata[4]:.1%}"
-                    "<br>Quality floor: %{customdata[5]:.1%}"
-                    "<br>Quality accepted: %{customdata[6]}"
-                )
+        for column, label, colour, width in traces:
             figure.add_trace(
                 go.Scatter(
                     x=frame.index,
@@ -333,8 +407,8 @@ class AdvanceDeclinePanel:
                     name=label,
                     mode="lines",
                     line={"color": colour, "width": width},
-                    customdata=customdata,
-                    hovertemplate=hover + "<extra></extra>",
+                    hovertemplate=f"<b>{label}</b>: %{{y:.2f}}<extra></extra>",
+                    meta={"sparkline": column == "cumulative_ad"},
                 )
             )
         return _style(figure, "Cumulative net issues")
@@ -345,18 +419,14 @@ class RasiPanel:
     indicator_key = "mcclellan_rasi"
     title = "McClellan Ratio-Adjusted Summation Index"
 
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        return _mcclellan_summary(result, oscillator=False)
+
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = display_frame(result)
         figure = go.Figure()
         figure.add_hline(y=0, line_width=1, line_color="rgba(22, 33, 29, 0.28)")
         positive, negative = _signed_rasi_paths(frame)
-        customdata = frame[["mcclellan_oscillator", "ratio_ema19", "ratio_ema39"]]
-        hover = (
-            "<b>RASI</b>: %{y:.2f}<br>"
-            "Oscillator: %{customdata[0]:.2f}<br>"
-            "Ratio EMA 19: %{customdata[1]:.2f}<br>"
-            "Ratio EMA 39: %{customdata[2]:.2f}<extra></extra>"
-        )
         for values, label, colour, fill in (
             (
                 positive,
@@ -383,6 +453,7 @@ class RasiPanel:
                     hoverinfo="skip",
                     showlegend=False,
                     connectgaps=False,
+                    meta={"external_legend": False, "sparkline": True},
                 )
             )
         # Keep hover on real market sessions only. The two visible traces also
@@ -395,10 +466,16 @@ class RasiPanel:
                 name="RASI",
                 mode="markers",
                 marker={"color": "rgba(0,0,0,0)", "size": 10},
-                customdata=customdata,
-                hovertemplate=hover,
+                hovertemplate="<b>RASI</b>: %{y:.2f}<extra></extra>",
                 showlegend=False,
-                meta={"external_legend": False},
+                meta={
+                    "external_legend_label": "RASI",
+                    "external_legend_color": (
+                        "linear-gradient(90deg, #147d64 0 50%, #b84b45 50% 100%)"
+                    ),
+                    "external_hover_color": COLORS["ink"],
+                    "sparkline_anchor": True,
+                },
             )
         )
         return _style(figure, "Ratio-adjusted cumulative oscillator")
@@ -408,6 +485,9 @@ class McClellanOscillatorPanel:
     key = "mcclellan-oscillator-chart"
     indicator_key = "mcclellan_rasi"
     title = "McClellan Oscillator"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        return _mcclellan_summary(result, oscillator=True)
 
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = display_frame(result)
@@ -421,6 +501,7 @@ class McClellanOscillatorPanel:
                 mode="lines",
                 line={"color": COLORS["ink"], "width": 2.0},
                 hovertemplate="<b>Oscillator</b>: %{y:.2f}<extra></extra>",
+                meta={"sparkline": True},
             )
         )
         return _style(figure, "EMA19 − EMA39", include_zero=True)
@@ -430,6 +511,9 @@ class NewHighsPanel:
     key = "new-highs-chart"
     indicator_key = "new_high_low"
     title = "New 52-Week Highs"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        return _new_high_low_summary(result, "highs")
 
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
@@ -444,15 +528,8 @@ class NewHighsPanel:
                 line={"color": "#111111", "width": 2.0},
                 fill="tozeroy",
                 fillcolor="rgba(17, 17, 17, 0.18)",
-                customdata=frame[
-                    ["eligible_issues", "quoted_issues", "active_issues", "coverage"]
-                ],
-                hovertemplate=(
-                    "<b>New highs</b>: %{y:.0f}<br>"
-                    "Eligible history: %{customdata[0]:.0f}<br>"
-                    "Quotes: %{customdata[1]:.0f} / %{customdata[2]:.0f}<br>"
-                    "Coverage: %{customdata[3]:.1%}<extra></extra>"
-                ),
+                hovertemplate="<b>New highs</b>: %{y:.0f}<extra></extra>",
+                meta={"sparkline": True},
             )
         )
         return _style(
@@ -468,6 +545,9 @@ class NewLowsPanel:
     indicator_key = "new_high_low"
     title = "New 52-Week Lows"
 
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        return _new_high_low_summary(result, "lows")
+
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
         negative_lows = -frame["new_lows"]
@@ -482,21 +562,8 @@ class NewLowsPanel:
                 line={"color": COLORS["red"], "width": 2.0},
                 fill="tozeroy",
                 fillcolor="rgba(184, 75, 69, 0.20)",
-                customdata=frame[
-                    [
-                        "new_lows",
-                        "eligible_issues",
-                        "quoted_issues",
-                        "active_issues",
-                        "coverage",
-                    ]
-                ],
-                hovertemplate=(
-                    "<b>New lows</b>: %{customdata[0]:.0f}<br>"
-                    "Eligible history: %{customdata[1]:.0f}<br>"
-                    "Quotes: %{customdata[2]:.0f} / %{customdata[3]:.0f}<br>"
-                    "Coverage: %{customdata[4]:.1%}<extra></extra>"
-                ),
+                hovertemplate="<b>New lows</b>: %{y:.0f}<extra></extra>",
+                meta={"sparkline": True},
             )
         )
         return _style(
@@ -512,6 +579,9 @@ class NetNewHighsPanel:
     indicator_key = "new_high_low"
     title = "New Highs − New Lows"
 
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        return _new_high_low_summary(result, "net")
+
     def figure(self, result: IndicatorResult) -> go.Figure:
         frame = result.frame
         figure = go.Figure()
@@ -523,24 +593,8 @@ class NetNewHighsPanel:
                 name="NH − NL",
                 mode="lines",
                 line={"color": COLORS["ink"], "width": 2.0},
-                customdata=frame[
-                    [
-                        "new_highs",
-                        "new_lows",
-                        "eligible_issues",
-                        "quoted_issues",
-                        "active_issues",
-                        "coverage",
-                    ]
-                ],
-                hovertemplate=(
-                    "<b>NH − NL</b>: %{y:.0f}<br>"
-                    "New highs: %{customdata[0]:.0f}<br>"
-                    "New lows: %{customdata[1]:.0f}<br>"
-                    "Eligible history: %{customdata[2]:.0f}<br>"
-                    "Quotes: %{customdata[3]:.0f} / %{customdata[4]:.0f}<br>"
-                    "Coverage: %{customdata[5]:.1%}<extra></extra>"
-                ),
+                hovertemplate="<b>NH − NL</b>: %{y:.0f}<extra></extra>",
+                meta={"sparkline": True},
             )
         )
         return _style(
@@ -548,6 +602,71 @@ class NetNewHighsPanel:
             "NH − NL",
             include_zero=True,
         )
+
+
+def _mcclellan_summary(
+    result: IndicatorResult,
+    *,
+    oscillator: bool,
+) -> PanelSummary:
+    frame = display_frame(result)
+    latest = None if frame.empty else frame.iloc[-1]
+    warmup = int(result.metadata.get("warmup_sessions", 0) or 0)
+    label = "McClellan oscillator" if oscillator else "RASI"
+    column = "mcclellan_oscillator" if oscillator else "rasi"
+    if latest is None:
+        detail = (
+            f"Insufficient {warmup}-session display warm-up"
+            if warmup
+            else "Unavailable"
+        )
+        return PanelSummary(label, "—", detail)
+    value = latest[column]
+    detail = signal_label(
+        value,
+        positive_label="Positive impulse" if oscillator else "Above zero",
+        negative_label="Negative impulse" if oscillator else "Below zero",
+    )
+    tone = sign_tone(value)
+    if latest_quality(result, latest) is False:
+        detail = held_state(last_accepted_session(result))
+        tone = "neutral"
+    return PanelSummary(label, number(value, 1), detail, tone)
+
+
+def _new_high_low_summary(
+    result: IndicatorResult,
+    kind: str,
+) -> PanelSummary:
+    latest = latest_row(result)
+    labels = {
+        "highs": "New 52-week highs",
+        "lows": "New 52-week lows",
+        "net": "New highs − lows",
+    }
+    label = labels[kind]
+    if latest is None:
+        return PanelSummary(label, "—", "Unavailable")
+    highs = latest["new_highs"]
+    lows = latest["new_lows"]
+    net = latest["nh_nl"]
+    eligible = latest["eligible_issues"]
+    if kind == "highs":
+        value = number(highs, 0)
+        detail = constituent_share(highs, eligible)
+        tone = "positive" if positive(highs) else "neutral"
+    elif kind == "lows":
+        value = f"{number(lows, 0)} lows" if not is_missing(lows) else "—"
+        detail = constituent_share(lows, eligible)
+        tone = "negative" if positive(lows) else "neutral"
+    else:
+        value = number(net, 0)
+        detail = f"{number(highs, 0)} highs · {number(lows, 0)} lows"
+        tone = sign_tone(net)
+    if latest_quality(result, latest) is False:
+        detail = held_state(last_accepted_session(result))
+        tone = "neutral"
+    return PanelSummary(label, value, detail, tone)
 
 
 def _style(
@@ -573,7 +692,7 @@ def _style(
             "color": COLORS["ink"],
         },
         height=445,
-        margin={"l": 62, "r": 26, "t": 72, "b": 48},
+        margin={"l": 62, "r": 26, "t": 28, "b": 48},
         hovermode="x unified",
         hoverlabel={
             "bgcolor": "#fffdf8",
@@ -581,6 +700,7 @@ def _style(
             "font": {"color": COLORS["ink"]},
         },
         dragmode="zoom",
+        showlegend=False,
         legend={
             "orientation": "h",
             "y": 1.13,

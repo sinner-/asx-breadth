@@ -44,13 +44,46 @@ def run_indicators(
     context: IndicatorContext,
     indicators: Sequence[Indicator],
 ) -> dict[str, IndicatorResult]:
-    """Run plugins in declared order and enforce explicit dependencies."""
-    results: dict[str, IndicatorResult] = {}
+    """Run plugins in dependency order, independent of registration order."""
+    registered: dict[str, Indicator] = {}
     for indicator in indicators:
-        missing = [key for key in indicator.dependencies if key not in results]
-        if missing:
-            raise ValueError(
-                f"Indicator {indicator.key!r} is missing dependencies: {missing}"
+        if indicator.key in registered:
+            raise ValueError(f"Duplicate indicator key: {indicator.key!r}")
+        registered[indicator.key] = indicator
+
+    missing = {
+        key: tuple(
+            dependency
+            for dependency in indicator.dependencies
+            if dependency not in registered
+        )
+        for key, indicator in registered.items()
+    }
+    missing = {
+        key: dependencies for key, dependencies in missing.items() if dependencies
+    }
+    if missing:
+        details = "; ".join(
+            f"{key!r} requires {list(dependencies)!r}"
+            for key, dependencies in missing.items()
+        )
+        raise ValueError(f"Missing indicator dependencies: {details}")
+
+    results: dict[str, IndicatorResult] = {}
+    pending = dict(registered)
+    while pending:
+        ready = [
+            key
+            for key, indicator in pending.items()
+            if all(dependency in results for dependency in indicator.dependencies)
+        ]
+        if not ready:
+            details = "; ".join(
+                f"{key!r} -> {list(indicator.dependencies)!r}"
+                for key, indicator in pending.items()
             )
-        results[indicator.key] = indicator.calculate(context, results)
+            raise ValueError(f"Cyclic indicator dependencies: {details}")
+        for key in ready:
+            indicator = pending.pop(key)
+            results[key] = indicator.calculate(context, results)
     return results

@@ -76,6 +76,69 @@ class DashboardTests(unittest.TestCase):
         )
 
 
+class IndicatorRunnerTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.context = IndicatorContext(
+            snapshot=Snapshot(
+                snapshot_id=1,
+                universe_code="TEST",
+                universe_name="Test universe",
+                as_of_date=date(2026, 7, 18),
+                source_path="test.xlsx",
+                instruments=(),
+            ),
+            factors=pd.DataFrame(),
+        )
+
+    def test_resolves_dependencies_independent_of_registration_order(self) -> None:
+        calls: list[str] = []
+        indicators = (
+            _RecordingIndicator("leaf", ("middle",), calls),
+            _RecordingIndicator("root", (), calls),
+            _RecordingIndicator("middle", ("root",), calls),
+        )
+
+        results = run_indicators(self.context, indicators)
+
+        self.assertEqual(calls, ["root", "middle", "leaf"])
+        self.assertEqual(list(results), calls)
+
+    def test_rejects_duplicate_indicator_keys_before_calculation(self) -> None:
+        calls: list[str] = []
+        indicators = (
+            _RecordingIndicator("duplicate", (), calls),
+            _RecordingIndicator("duplicate", (), calls),
+        )
+
+        with self.assertRaisesRegex(ValueError, "Duplicate indicator key: 'duplicate'"):
+            run_indicators(self.context, indicators)
+        self.assertEqual(calls, [])
+
+    def test_rejects_missing_dependencies_before_calculation(self) -> None:
+        calls: list[str] = []
+
+        with self.assertRaisesRegex(
+            ValueError,
+            r"Missing indicator dependencies: 'dependent' requires \['absent'\]",
+        ):
+            run_indicators(
+                self.context,
+                (_RecordingIndicator("dependent", ("absent",), calls),),
+            )
+        self.assertEqual(calls, [])
+
+    def test_rejects_dependency_cycles_before_calculation(self) -> None:
+        calls: list[str] = []
+        indicators = (
+            _RecordingIndicator("first", ("second",), calls),
+            _RecordingIndicator("second", ("first",), calls),
+        )
+
+        with self.assertRaisesRegex(ValueError, "Cyclic indicator dependencies"):
+            run_indicators(self.context, indicators)
+        self.assertEqual(calls, [])
+
+
 class HoldingsTests(unittest.TestCase):
     def test_finds_headers_and_maps_asx_symbols(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -940,7 +1003,9 @@ class IndicatorTests(unittest.TestCase):
         self.assertTrue(all(trace.fill == "toself" for trace in below_fills))
         self.assertIsNone(traces["AXVI above EMA"].fill)
         self.assertIsNone(traces["AXVI below EMA"].fill)
-        self.assertIn("200-session EMA", traces["AXVI"].hovertemplate)
+        self.assertNotIn("Spread", traces["AXVI"].hovertemplate)
+        self.assertNotIn("Above", traces["AXVI"].hovertemplate)
+        self.assertIn("200-session EMA", traces["200-session EMA"].hovertemplate)
 
     def test_ratio_adjustment_divides_by_advances_plus_declines(self) -> None:
         ad = pd.DataFrame(
@@ -1630,6 +1695,28 @@ def _holdings_file(
         ),
         sha256=sha256,
     )
+
+
+class _RecordingIndicator:
+    def __init__(
+        self,
+        key: str,
+        dependencies: tuple[str, ...],
+        calls: list[str],
+    ) -> None:
+        self.key = key
+        self.dependencies = dependencies
+        self.calls = calls
+
+    def calculate(
+        self,
+        context: IndicatorContext,
+        results: dict[str, IndicatorResult],
+    ) -> IndicatorResult:
+        del context
+        assert all(dependency in results for dependency in self.dependencies)
+        self.calls.append(self.key)
+        return IndicatorResult(self.key, self.key, pd.DataFrame())
 
 
 class _FakeProvider:

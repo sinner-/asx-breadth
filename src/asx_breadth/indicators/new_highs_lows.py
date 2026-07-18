@@ -151,10 +151,14 @@ class NewHighLow:
 
 def _price_extremes(group: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
     previous_total_return_index = 100.0
+    previous_date: pd.Timestamp | None = None
+    chain_available = True
+    has_previous_dates = "previous_trade_date" in group
     dates: list[pd.Timestamp] = []
     highs: list[float] = []
     lows: list[float] = []
-    for row in group.itertuples(index=False):
+    for position, row in enumerate(group.itertuples(index=False)):
+        trade_date = pd.Timestamp(row.trade_date)
         close_factor = _positive(row.close_to_previous_close)
         # Production factor frames always contain total_return_factor. Falling
         # back to close preserves the small synthetic plugin interface used by
@@ -164,8 +168,28 @@ def _price_extremes(group: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
         )
         high_factor = _positive(row.high_to_previous_close)
         low_factor = _positive(row.low_to_previous_close)
-        dates.append(row.trade_date)
-        if total_return_factor is not None and close_factor is not None:
+        dates.append(trade_date)
+
+        if position == 0:
+            # The first cached row is the arbitrary scale anchor; its own factor
+            # has no predecessor and therefore cannot supply an intraday range.
+            highs.append(np.nan)
+            lows.append(np.nan)
+            previous_date = trade_date
+            continue
+
+        links_previous = True
+        if has_previous_dates:
+            reported_previous = getattr(row, "previous_trade_date")
+            links_previous = (
+                pd.notna(reported_previous)
+                and previous_date is not None
+                and pd.Timestamp(reported_previous) == previous_date
+            )
+        if total_return_factor is None or not links_previous:
+            chain_available = False
+
+        if chain_available and close_factor is not None:
             # AdjClose return / raw-close return is the change in Yahoo's
             # adjustment factor. Applying it to the raw intraday factors puts
             # highs, lows, and the close on one append-stable total-return
@@ -181,10 +205,12 @@ def _price_extremes(group: pd.DataFrame) -> tuple[pd.Series, pd.Series]:
                 if low_factor is not None
                 else np.nan
             )
-            previous_total_return_index *= total_return_factor
         else:
             highs.append(np.nan)
             lows.append(np.nan)
+        if chain_available:
+            previous_total_return_index *= total_return_factor
+        previous_date = trade_date
     return (
         pd.Series(highs, index=dates, dtype=float),
         pd.Series(lows, index=dates, dtype=float),

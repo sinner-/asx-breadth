@@ -81,7 +81,11 @@ class AdvanceDecline:
             declines=("decline", "sum"),
             unchanged=("unchanged", "sum"),
         )
-        frame = grouped.reindex(sessions[1:], fill_value=0).astype(
+        active_sessions = pd.DatetimeIndex(
+            membership["trade_date"].drop_duplicates().sort_values()
+        )
+        eligible_sessions = sessions[1:][sessions[1:].isin(active_sessions)]
+        frame = grouped.reindex(eligible_sessions, fill_value=0).astype(
             {"advances": int, "declines": int, "unchanged": int}
         )
         frame.index.name = "trade_date"
@@ -97,17 +101,16 @@ class AdvanceDecline:
         raw_net_advances = frame["advances"] - frame["declines"]
         frame["net_advances"] = raw_net_advances.where(frame["quality_ok"])
         frame["cumulative_ad"] = frame["net_advances"].fillna(0).cumsum()
+        accepted = frame["quality_ok"] & frame["net_advances"].notna()
         for span in (19, 39, 200):
-            frame[f"cumulative_ad_ema{span}"] = (
-                frame["cumulative_ad"]
-                .ewm(span=span, adjust=False, min_periods=span)
-                .mean()
+            frame[f"cumulative_ad_ema{span}"] = _accepted_session_ema(
+                frame["cumulative_ad"], accepted, span=span
             )
-        frame["net_advances_ema19"] = (
-            frame["net_advances"].ewm(span=19, adjust=False, min_periods=19).mean()
+        frame["net_advances_ema19"] = _accepted_session_ema(
+            frame["net_advances"], accepted, span=19
         )
-        frame["net_advances_ema39"] = (
-            frame["net_advances"].ewm(span=39, adjust=False, min_periods=39).mean()
+        frame["net_advances_ema39"] = _accepted_session_ema(
+            frame["net_advances"], accepted, span=39
         )
         return IndicatorResult(
             key=self.key,
@@ -121,3 +124,22 @@ class AdvanceDecline:
                 "gap_policy": "A missing or halted issue is unclassified for that session",
             },
         )
+
+
+def _accepted_session_ema(
+    series: pd.Series,
+    accepted: pd.Series,
+    *,
+    span: int,
+) -> pd.Series:
+    """Advance EMA state only when the session supplied accepted breadth."""
+    return (
+        series.where(accepted)
+        .ewm(
+            span=span,
+            adjust=False,
+            ignore_na=True,
+            min_periods=span,
+        )
+        .mean()
+    )

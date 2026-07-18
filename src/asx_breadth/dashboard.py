@@ -15,8 +15,11 @@ from plotly.graph_objects import Figure
 
 from .indicators.base import IndicatorResult
 from .models import Snapshot
-from .panels.base import DashboardPanel
-from .panels.charts import display_frame
+from .panels.base import DashboardPanel, PanelSummary
+from .panels.summary import relative_state
+
+
+_relative_state = relative_state
 
 
 PLOT_CONFIG = {
@@ -47,165 +50,32 @@ def render_dashboard(
 ) -> None:
     output = output.expanduser().resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
-    ad_result = results["advance_decline"]
-    rasi_result = results["mcclellan_rasi"]
-    benchmark_result = results["benchmark_trend"]
-    new_high_low_result = results["new_high_low"]
-    ad = ad_result.frame
-    rasi = display_frame(rasi_result)
-    benchmark = benchmark_result.frame
-    new_high_low = new_high_low_result.frame
-    latest_ad = ad.iloc[-1] if not ad.empty else None
-    latest_rasi = rasi.iloc[-1] if not rasi.empty else None
-    latest_benchmark = benchmark.iloc[-1] if not benchmark.empty else None
-    latest_new_high_low = new_high_low.iloc[-1] if not new_high_low.empty else None
 
-    vas_detail, vas_tone = _relative_state(
-        latest_benchmark["total_return_index"]
-        if latest_benchmark is not None
-        else None,
-        latest_benchmark["total_return_ema19"]
-        if latest_benchmark is not None
-        else None,
-        latest_benchmark["total_return_ema39"]
-        if latest_benchmark is not None
-        else None,
-        include_values=True,
-    )
-    if latest_benchmark is not None:
-        band_detail, _ = _band_state(
-            latest_benchmark["total_return_index"],
-            latest_benchmark["low_ema200"],
-            latest_benchmark["high_ema200"],
-        )
-        vas_detail = f"{vas_detail} · {band_detail}"
-    ad_detail, ad_tone = _relative_state(
-        latest_ad["cumulative_ad"] if latest_ad is not None else None,
-        latest_ad["cumulative_ad_ema19"] if latest_ad is not None else None,
-        latest_ad["cumulative_ad_ema39"] if latest_ad is not None else None,
-    )
-    oscillator = (
-        latest_rasi["mcclellan_oscillator"] if latest_rasi is not None else None
-    )
-    latest_rasi_value = latest_rasi["rasi"] if latest_rasi is not None else None
-    nh_nl = latest_new_high_low["nh_nl"] if latest_new_high_low is not None else None
-    latest_quality = _latest_quality(ad_result, latest_ad)
-    rasi_quality = _latest_quality(rasi_result, latest_rasi)
-    if rasi_quality is None:
-        rasi_quality = latest_quality
-    new_high_low_quality = _latest_quality(
-        new_high_low_result,
-        latest_new_high_low,
-    )
-    last_accepted = _last_accepted_session(ad_result, ad)
-    rasi_warmup = int(rasi_result.metadata.get("warmup_sessions", 0) or 0)
-
-    if latest_quality is False:
-        ad_detail, ad_tone = _held_state(last_accepted), "neutral"
-
-    oscillator_detail = _signal_label(
-        oscillator,
-        positive="Positive impulse",
-        negative="Negative impulse",
-    )
-    oscillator_tone = _sign_tone(oscillator)
-    rasi_detail = _signal_label(
-        latest_rasi_value,
-        positive="Above zero",
-        negative="Below zero",
-    )
-    rasi_tone = _sign_tone(latest_rasi_value)
-    if latest_rasi is None and rasi_warmup:
-        oscillator_detail = rasi_detail = (
-            f"Insufficient {rasi_warmup}-session display warm-up"
-        )
-        oscillator_tone = rasi_tone = "neutral"
-    elif rasi_quality is False:
-        oscillator_detail = rasi_detail = _held_state(last_accepted)
-        oscillator_tone = rasi_tone = "neutral"
-
-    nh_detail = (
-        f"{_number(latest_new_high_low['new_highs'], 0)} highs · "
-        f"{_number(latest_new_high_low['new_lows'], 0)} lows"
-        if latest_new_high_low is not None
-        else "Unavailable"
-    )
-    nh_tone = _sign_tone(nh_nl)
-    if new_high_low_quality is False:
-        nh_detail = _held_state(
-            _last_accepted_session(new_high_low_result, new_high_low)
-        )
-        nh_tone = "neutral"
-
-    kpis = [
-        (
-            "VAS total return",
-            _number(
-                latest_benchmark["total_return_index"]
-                if latest_benchmark is not None
-                else None,
-                2,
-            ),
-            vas_detail,
-            vas_tone,
-        ),
-        (
-            "Cumulative A/D",
-            _number(latest_ad["cumulative_ad"] if latest_ad is not None else None, 0),
-            ad_detail,
-            ad_tone,
-        ),
-        (
-            "McClellan oscillator",
-            _number(oscillator, 1),
-            oscillator_detail,
-            oscillator_tone,
-        ),
-        (
-            "RASI",
-            _number(latest_rasi_value, 1),
-            rasi_detail,
-            rasi_tone,
-        ),
-        (
-            "New highs − lows",
-            _number(nh_nl, 0),
-            nh_detail,
-            nh_tone,
-        ),
-        (
-            "Breadth coverage",
-            _percent(latest_ad["coverage"] if latest_ad is not None else None),
-            (
-                "Latest session accepted"
-                if latest_quality is True
-                else (
-                    "Latest session withheld"
-                    if latest_quality is False
-                    else "Unavailable"
-                )
-            ),
-            (
-                "positive"
-                if latest_quality is True
-                else ("negative" if latest_quality is False else "neutral")
-            ),
-        ),
-    ]
-    kpi_html = "".join(
-        f'<div class="kpi {tone}"><span>{html.escape(label)}</span>'
-        f"<strong>{html.escape(value)}</strong><small>{html.escape(detail)}</small></div>"
-        for label, value, detail, tone in kpis
-    )
-
-    chart_html: list[str] = []
+    selector_html: list[str] = []
+    chart_views: list[str] = []
     plot_ids: list[str] = []
     plotly_included = False
+    prepared_panels: list[
+        tuple[DashboardPanel, IndicatorResult | None, Figure | None]
+    ] = []
     for panel in panels:
         result = results.get(panel.indicator_key)
+        figure = None if result is None or result.frame.empty else panel.figure(result)
+        prepared_panels.append((panel, result, figure))
+    active_index = next(
+        (
+            index
+            for index, (_, _, figure) in enumerate(prepared_panels)
+            if figure is not None and _figure_has_data(figure)
+        ),
+        0,
+    )
+
+    for index, (panel, result, figure) in enumerate(prepared_panels):
         heading_id = f"heading-{panel.key}"
-        unavailable = result is None or result.frame.empty
-        figure = None if unavailable else panel.figure(result)
+        view_id = f"view-{panel.key}"
+        active = index == active_index
+        plot_id = ""
         if figure is None or not _figure_has_data(figure):
             message = "Unavailable or insufficient verified history."
             if (
@@ -217,44 +87,68 @@ def render_dashboard(
                     "Insufficient history after the "
                     f"{int(result.metadata['warmup_sessions'])}-session display warm-up."
                 )
-            chart_html.append(
-                '<section class="chart-card unavailable" '
+            chart_views.append(
+                '<section class="chart-view unavailable'
+                f'{" is-active" if active else ""}" id="{html.escape(view_id)}" '
+                f'aria-hidden="{str(not active).lower()}" '
                 f'aria-labelledby="{html.escape(heading_id)}">'
                 '<div class="chart-heading">'
                 f'<h2 id="{html.escape(heading_id)}">{html.escape(panel.title)}</h2>'
                 f"</div><p>{html.escape(message)}</p></section>"
             )
-            continue
-        plot_id = f"plot-{panel.key}"
-        chart = pio.to_html(
-            figure,
-            full_html=False,
-            include_plotlyjs="inline" if not plotly_included else False,
-            config=PLOT_CONFIG,
-            div_id=plot_id,
+        else:
+            plot_id = f"plot-{panel.key}"
+            chart = pio.to_html(
+                figure,
+                full_html=False,
+                include_plotlyjs="inline" if not plotly_included else False,
+                config=PLOT_CONFIG,
+                div_id=plot_id,
+            )
+            chart = chart.replace(
+                f'id="{plot_id}"',
+                f'id="{plot_id}" role="group" aria-label="{html.escape(panel.title)} interactive chart"',
+                1,
+            )
+            plot_ids.append(plot_id)
+            plotly_included = True
+            chart_views.append(
+                '<section class="chart-view'
+                f'{" is-active" if active else ""}" id="{html.escape(view_id)}" '
+                f'aria-hidden="{str(not active).lower()}" '
+                f'aria-labelledby="{html.escape(heading_id)}">'
+                '<div class="chart-heading">'
+                f'<h2 id="{html.escape(heading_id)}">{html.escape(panel.title)}</h2>'
+                "<span>Drag to zoom · Ctrl/⌘ + wheel · double-click to reset</span>"
+                "</div>"
+                f"{_chart_meta(figure, plot_id)}{chart}</section>"
+            )
+
+        summary = (
+            panel.summary(result)
+            if result is not None
+            else PanelSummary(panel.title, "—", "Unavailable")
         )
-        chart = chart.replace(
-            f'id="{plot_id}"',
-            f'id="{plot_id}" role="group" aria-label="{html.escape(panel.title)} interactive chart"',
-            1,
+        selector_html.append(
+            '<button type="button" class="kpi chart-selector '
+            f'{html.escape(summary.tone)}{" is-active" if active else ""}" '
+            f'data-chart-target="{html.escape(view_id)}" '
+            f'data-plot-id="{html.escape(plot_id)}" '
+            f'aria-controls="{html.escape(view_id)}" '
+            f'aria-pressed="{str(active).lower()}">'
+            f'<span class="kpi-label">{html.escape(summary.label)}</span>'
+            f"<strong>{html.escape(summary.value)}</strong>"
+            f"<small>{html.escape(summary.detail)}</small>"
+            '<span class="spark-period" aria-hidden="true">1Y</span>'
+            f"{_sparkline_svg(figure, panel.title) if figure is not None else _empty_sparkline(panel.title)}"
+            "</button>"
         )
-        plot_ids.append(plot_id)
-        plotly_included = True
-        chart_html.append(
-            '<section class="chart-card" '
-            f'aria-labelledby="{html.escape(heading_id)}">'
-            '<div class="chart-heading">'
-            f'<h2 id="{html.escape(heading_id)}">{html.escape(panel.title)}</h2>'
-            "<span>Drag to zoom · Ctrl/⌘ + wheel · double-click to reset</span>"
-            "</div>"
-            f"{_mobile_legend(figure)}{chart}</section>"
-        )
-    if not plot_ids:
-        chart_html = [
-            '<section class="empty"><h2>No market data cached yet</h2>'
-            "<p>The dashboard shell was still generated. Run the command again later; "
-            "provider failures are retried with backoff and do not corrupt the cache.</p></section>"
-        ]
+
+    kpi_html = "".join(selector_html)
+    chart_pane_html = (
+        '<section class="chart-pane" aria-label="Expanded chart">'
+        f"{''.join(chart_views)}</section>"
+    )
 
     generated_at = datetime.now(ZoneInfo("Australia/Sydney"))
     generated = generated_at.strftime("%d %b %Y, %H:%M %Z")
@@ -272,30 +166,41 @@ def render_dashboard(
     * {{ box-sizing:border-box; }}
     body {{ margin:0; color:var(--ink); background:var(--paper);
             font-family:Inter,ui-sans-serif,system-ui,-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }}
-    .shell {{ width:min(1440px,calc(100% - 36px)); margin:0 auto; padding:38px 0 50px; }}
-    header {{ display:flex; gap:28px; justify-content:space-between; align-items:end; margin-bottom:24px; }}
-    .eyebrow {{ color:var(--green); font-size:.75rem; font-weight:800; letter-spacing:.14em;
-                text-transform:uppercase; }}
-    h1 {{ margin:.3rem 0 .45rem; font-family:Georgia,"Times New Roman",serif;
-          font-size:clamp(2rem,4vw,3.7rem); font-weight:500; line-height:1; }}
-    .subtitle,.stamp {{ margin:0; color:var(--muted); }}
-    .stamp {{ max-width:680px; text-align:right; font-size:.84rem; line-height:1.55; }}
-    .kpis {{ display:grid; grid-template-columns:repeat(6,1fr); gap:12px; margin-bottom:18px; }}
-    .kpi,.range-control,.chart-card,.empty {{ background:var(--card); border:1px solid var(--line);
+    .shell {{ width:min(1440px,calc(100% - 36px)); margin:0 auto; padding:18px 0 38px; }}
+    .kpis {{ display:grid; grid-template-columns:repeat(5,1fr); gap:8px; margin-bottom:10px; }}
+    .kpi,.range-control,.chart-pane,.empty {{ background:var(--card); border:1px solid var(--line);
                                      border-radius:16px; box-shadow:var(--shadow); }}
-    .kpi {{ padding:16px 16px 14px; border-top:3px solid var(--line); }}
+    .kpi {{ --spark:var(--ink); position:relative; min-width:0; padding:10px 12px 8px; color:var(--ink);
+            border-top:3px solid var(--line); text-align:left; font:inherit; cursor:pointer;
+            appearance:none; transition:border-color .15s ease,box-shadow .15s ease; }}
+    .kpi:hover {{ border-color:#aeb8b1; }}
+    .kpi:focus-visible {{ outline:3px solid rgba(20,125,100,.28); outline-offset:2px; }}
+    .kpi.is-active {{ border-color:var(--ink); box-shadow:0 0 0 1px var(--ink),var(--shadow); }}
     .kpi.positive {{ border-top-color:var(--green); }}
     .kpi.negative {{ border-top-color:var(--red); }}
     .kpi.neutral {{ border-top-color:var(--amber); }}
-    .kpi span {{ display:block; color:var(--muted); font-size:.75rem; font-weight:700;
-                 letter-spacing:.07em; text-transform:uppercase; }}
-    .kpi strong {{ display:block; margin-top:7px; font-family:Georgia,"Times New Roman",serif;
-                   font-size:1.55rem; font-weight:500; }}
-    .kpi small {{ display:block; min-height:2.5em; margin-top:5px; color:var(--muted);
-                  font-size:.72rem; line-height:1.25; }}
+    .kpi.ink {{ border-top-color:var(--ink); }}
+    .kpi-label {{ display:block; overflow:hidden; color:var(--muted); font-size:.67rem;
+                  font-weight:750; letter-spacing:.06em; text-overflow:ellipsis;
+                  text-transform:uppercase; white-space:nowrap; }}
+    .kpi strong {{ display:block; margin-top:3px; font-family:Georgia,"Times New Roman",serif;
+                   font-size:1.3rem; font-weight:500; line-height:1; }}
+    .kpi small {{ display:-webkit-box; overflow:hidden; height:2.35em; margin-top:3px;
+                  color:var(--muted); font-size:.64rem; line-height:1.18;
+                  -webkit-box-orient:vertical; -webkit-line-clamp:2; }}
+    .sparkline {{ display:block; width:100%; height:34px; margin-top:4px; overflow:visible;
+                  color:var(--spark); }}
+    .spark-path {{ fill:none; stroke:var(--spark-stroke,currentColor); stroke-width:1.7;
+                   vector-effect:non-scaling-stroke; }}
+    .spark-end {{ fill:currentColor; }}
+    .spark-zero {{ stroke:rgba(22,33,29,.18); stroke-width:1;
+                   vector-effect:non-scaling-stroke; }}
+    .spark-empty line {{ stroke:var(--line); stroke-width:1; }}
+    .spark-period {{ position:absolute; right:10px; bottom:5px; color:rgba(100,114,108,.72);
+                     font-size:.55rem; font-weight:750; letter-spacing:.04em; }}
     .range-control {{ display:flex; align-items:center; justify-content:space-between; gap:14px;
                       position:sticky; top:10px; z-index:20; padding:10px 14px;
-                      margin-bottom:2px; }}
+                      margin-bottom:10px; }}
     .range-control > span {{ color:var(--muted); font-size:.75rem; font-weight:750;
                              letter-spacing:.07em; text-transform:uppercase; }}
     .range-buttons {{ display:flex; gap:6px; }}
@@ -306,10 +211,11 @@ def render_dashboard(
     .range-buttons button:focus-visible {{ outline:3px solid rgba(20,125,100,.28); outline-offset:2px; }}
     .range-buttons button[aria-pressed="true"] {{ color:#fff; border-color:var(--green);
                                                    background:var(--green); }}
-    .chart-card {{ padding:0 10px 4px; margin-top:18px; overflow:hidden; }}
-    .hoverlayer .legend > rect.bg,
-    .hoverlayer .hovertext > path {{ fill:var(--card) !important; fill-opacity:1 !important;
-                                     stroke:rgba(22,33,29,.28) !important; }}
+    .chart-pane {{ position:relative; min-height:520px; padding:0 10px 4px; overflow:hidden; }}
+    .chart-view {{ position:absolute; inset:0; width:100%; visibility:hidden;
+                   pointer-events:none; }}
+    .chart-view.is-active {{ position:relative; visibility:visible; pointer-events:auto; }}
+    .hoverlayer .legend,.hoverlayer .hovertext {{ display:none !important; }}
     .js-plotly-plot .nsewdrag {{ cursor:default !important; }}
     .js-plotly-plot .nsewdrag:active {{ cursor:ew-resize !important; }}
     .chart-heading {{ display:flex; justify-content:space-between; gap:20px; align-items:baseline;
@@ -317,45 +223,54 @@ def render_dashboard(
     .chart-heading h2 {{ margin:0; font-family:Georgia,"Times New Roman",serif;
                          font-size:1.35rem; font-weight:500; }}
     .chart-heading span {{ color:var(--muted); font-size:.78rem; }}
-    .mobile-legend {{ display:none; }}
-    .legend-item {{ display:inline-flex; align-items:center; gap:5px; }}
+    .chart-meta {{ display:flex; align-items:center; justify-content:flex-start;
+                   gap:12px 24px; min-height:38px; padding:9px 20px 2px; }}
+    .chart-legend,.hover-readout {{ display:flex; flex-wrap:wrap; align-items:center;
+                                   gap:7px 14px; color:var(--muted);
+                                   font-size:.72rem; line-height:1.2; }}
+    .hover-readout {{ justify-content:flex-start; min-width:260px; color:var(--ink); }}
+    .hover-date {{ color:var(--muted); font-weight:750; }}
+    .legend-item {{ display:inline-flex; align-items:center; gap:5px; white-space:nowrap; }}
+    .legend-value {{ color:var(--ink); font-variant-numeric:tabular-nums; }}
     .legend-swatch {{ width:17px; height:3px; border-radius:2px; background:var(--swatch); }}
     .empty {{ padding:42px; margin-top:18px; text-align:center; }}
     .unavailable {{ min-height:150px; }}
     .unavailable p {{ margin:24px 20px 34px; color:var(--muted); }}
-    @media (max-width:1100px) {{ .kpis {{ grid-template-columns:repeat(3,1fr); }} }}
-    @media (max-width:800px) {{ header {{ align-items:start; flex-direction:column; }}
-      .stamp {{ text-align:left; }} .kpis {{ grid-template-columns:repeat(2,1fr); }}
+    footer {{ display:flex; justify-content:space-between; gap:18px; padding:18px 4px 0;
+              color:var(--muted); font-size:.72rem; line-height:1.45; }}
+    footer p {{ margin:0; }}
+    footer p:last-child {{ max-width:760px; text-align:right; }}
+    @media (max-width:1100px) {{ .kpis {{ grid-template-columns:repeat(4,1fr); }} }}
+    @media (max-width:720px) {{ .kpis {{ grid-template-columns:repeat(2,1fr); }}
       .chart-heading {{ align-items:start; flex-direction:column; gap:4px; }}
-      .chart-heading span {{ display:none; }} }}
+      .chart-heading span {{ display:none; }} footer {{ flex-direction:column; }}
+      footer p:last-child {{ text-align:left; }} }}
     @media (max-width:460px) {{ .shell {{ width:min(100% - 20px,1440px); padding-top:22px; }}
-      .kpis {{ gap:8px; }} .kpi {{ padding:13px 12px 11px; }}
-      .kpi strong {{ font-size:1.35rem; }} .kpi small {{ font-size:.68rem; }} }}
+      .kpis {{ gap:7px; }} .kpi {{ padding:9px 9px 7px; }}
+      .kpi strong {{ font-size:1.2rem; }} .kpi small {{ font-size:.61rem; }}
+      .sparkline {{ height:30px; }} }}
     @media (max-width:600px) {{ .modebar {{ display:none !important; }}
       .range-control {{ top:6px; padding:8px 9px; }}
       .range-control > span {{ position:absolute; width:1px; height:1px; overflow:hidden;
                                clip:rect(0 0 0 0); white-space:nowrap; }}
       .range-buttons {{ width:100%; }}
       .range-buttons button {{ flex:1; min-height:40px; }}
-      .mobile-legend {{ display:flex; flex-wrap:wrap; gap:7px 12px; padding:8px 20px 0;
-                        color:var(--muted); font-size:.69rem; line-height:1.15; }} }}
+      .chart-meta {{ align-items:flex-start; flex-direction:column; padding:9px 10px 0; }}
+      .chart-legend,.hover-readout {{ gap:7px 11px; font-size:.69rem; }}
+      .hover-readout {{ justify-content:flex-start; min-width:0; }} }}
     @media (pointer:coarse) {{ .nsewdrag {{ touch-action:pan-y !important; }}
       .modebar-btn {{ width:34px !important; height:34px !important; }} }}
   </style>
 </head>
 <body>
   <main class="shell">
-    <header>
-      <div>
-        <div class="eyebrow">ASX market internals</div>
-        <h1>{html.escape(snapshot.universe_code)} breadth</h1>
-        <p class="subtitle">{html.escape(snapshot.universe_name)} · holdings as at {snapshot.as_of_date:%d %b %Y}</p>
-      </div>
-      <p class="stamp">Generated {html.escape(generated)}<br>{html.escape(sync_text)}</p>
-    </header>
-    <section class="kpis">{kpi_html}</section>
+    <section class="kpis" aria-label="Chart selector">{kpi_html}</section>
     {_range_controls(bool(plot_ids))}
-    {"".join(chart_html)}
+    {chart_pane_html}
+    <footer>
+      <p>{html.escape(snapshot.universe_name)} · holdings as at {snapshot.as_of_date:%d %b %Y}</p>
+      <p>Generated {html.escape(generated)}<br>{html.escape(sync_text)}</p>
+    </footer>
     {_visible_y_script(plot_ids)}
   </main>
 </body>
@@ -374,14 +289,149 @@ def _figure_has_data(figure: Figure) -> bool:
     )
 
 
-def _mobile_legend(figure: Figure) -> str:
+def _sparkline_svg(figure: Figure, title: str) -> str:
+    anchor = next(
+        (
+            item
+            for item in figure.data
+            if isinstance(item.meta, Mapping)
+            and item.meta.get("sparkline_anchor") is True
+        ),
+        None,
+    )
+    series = [
+        item
+        for item in figure.data
+        if isinstance(item.meta, Mapping) and item.meta.get("sparkline") is True
+    ]
+    if anchor is None:
+        anchor = series[0] if series else None
+    if anchor is None:
+        anchor = next(
+            (
+                item
+                for item in figure.data
+                if any(
+                    not _is_missing(value)
+                    for value in (item.y if item.y is not None else ())
+                )
+            ),
+            None,
+        )
+    if anchor is None or anchor.y is None or anchor.x is None:
+        return _empty_sparkline(title)
+    if not series:
+        series = [anchor]
+
+    anchor_points = [
+        (_spark_timestamp(raw_x, index), float(raw_y))
+        for index, (raw_x, raw_y) in enumerate(zip(anchor.x, anchor.y, strict=False))
+        if not _is_missing(raw_y)
+    ]
+    if not anchor_points:
+        return _empty_sparkline(title)
+    recent_anchor = anchor_points[-252:]
+    start = recent_anchor[0][0]
+    end = recent_anchor[-1][0]
+    if end <= start:
+        end = start + 1.0
+
+    plotted: list[tuple[object, list[tuple[float, float | None]]]] = []
+    finite: list[float] = []
+    for trace in series:
+        points: list[tuple[float, float | None]] = []
+        for index, (raw_x, raw_y) in enumerate(
+            zip(
+                trace.x if trace.x is not None else (),
+                trace.y if trace.y is not None else (),
+                strict=False,
+            )
+        ):
+            timestamp = _spark_timestamp(raw_x, index)
+            if timestamp < start or timestamp > end:
+                continue
+            value = None if _is_missing(raw_y) else float(raw_y)
+            points.append((timestamp, value))
+            if value is not None:
+                finite.append(value)
+        if points:
+            plotted.append((trace, points))
+    if not finite:
+        return _empty_sparkline(title)
+
+    low = min(finite)
+    high = max(finite)
+    span = high - low
+    if span == 0:
+        span = max(abs(high) * 0.1, 1.0)
+        low -= span / 2
+        high += span / 2
+
+    width = 240.0
+    height = 42.0
+    inset = 2.5
+    zero_line = ""
+    if low < 0 < high:
+        zero_y = inset + high / (high - low) * (height - inset * 2)
+        zero_line = (
+            f'<line class="spark-zero" x1="0" y1="{zero_y:.2f}" '
+            f'x2="{width:.0f}" y2="{zero_y:.2f}"></line>'
+        )
+    paths: list[str] = []
+    for trace, points in plotted:
+        commands: list[str] = []
+        drawing = False
+        for timestamp, value in points:
+            if value is None:
+                drawing = False
+                continue
+            x = (timestamp - start) / (end - start) * width
+            y = inset + (high - value) / (high - low) * (height - inset * 2)
+            commands.append(f"{'L' if drawing else 'M'}{x:.2f},{y:.2f}")
+            drawing = True
+        if not commands:
+            continue
+        colour = getattr(getattr(trace, "line", None), "color", None) or "#16211d"
+        paths.append(
+            '<path class="spark-path" '
+            f'style="--spark-stroke:{html.escape(str(colour), quote=True)}" '
+            f'd="{" ".join(commands)}"></path>'
+        )
+    return (
+        '<svg class="sparkline" viewBox="0 0 240 42" preserveAspectRatio="none" '
+        f'role="img" aria-label="One-year history for {html.escape(title, quote=True)}">'
+        f"{zero_line}{''.join(paths)}</svg>"
+    )
+
+
+def _spark_timestamp(value: object, fallback: int) -> float:
+    try:
+        return float(value.timestamp())
+    except (AttributeError, TypeError, ValueError):
+        try:
+            return datetime.fromisoformat(str(value)).timestamp()
+        except ValueError:
+            return float(fallback)
+
+
+def _empty_sparkline(title: str) -> str:
+    return (
+        '<svg class="sparkline spark-empty" viewBox="0 0 240 42" '
+        f'role="img" aria-label="No one-year history for {html.escape(title, quote=True)}">'
+        '<line x1="0" y1="21" x2="240" y2="21"></line></svg>'
+    )
+
+
+def _chart_meta(figure: Figure, plot_id: str) -> str:
     items: list[tuple[str, str]] = []
     for trace in figure.data:
         metadata = trace.meta if isinstance(trace.meta, Mapping) else {}
         if metadata.get("external_legend") is False:
             continue
-        name = str(trace.name or "").strip()
-        colour = getattr(getattr(trace, "line", None), "color", None)
+        name = str(metadata.get("external_legend_label") or trace.name or "").strip()
+        colour = metadata.get("external_legend_color") or getattr(
+            getattr(trace, "line", None), "color", None
+        )
         trace_values = trace.y if trace.y is not None else ()
         if (
             not name
@@ -392,15 +442,22 @@ def _mobile_legend(figure: Figure) -> str:
         key = (name, str(colour))
         if key not in items:
             items.append(key)
-    if len(items) < 2:
-        return ""
     content = "".join(
-        '<span class="legend-item"><i class="legend-swatch" aria-hidden="true" '
+        '<span class="legend-item" '
+        f'data-series="{html.escape(name, quote=True)}">'
+        '<i class="legend-swatch" aria-hidden="true" '
         f'style="--swatch:{html.escape(colour, quote=True)}"></i>'
-        f"{html.escape(name)}</span>"
+        f'<span class="legend-label">{html.escape(name)}</span>'
+        '<span class="legend-value"></span></span>'
         for name, colour in items
     )
-    return f'<div class="mobile-legend" aria-label="Chart legend">{content}</div>'
+    readout_id = f"hover-{plot_id}"
+    return (
+        '<div class="chart-meta">'
+        f'<div class="chart-legend" aria-label="Chart legend">{content}</div>'
+        f'<div class="hover-readout" id="{html.escape(readout_id)}" '
+        'aria-live="polite"></div></div>'
+    )
 
 
 def _range_controls(available: bool) -> str:
@@ -418,24 +475,6 @@ def _range_controls(available: bool) -> str:
     )
 
 
-def _latest_quality(result: IndicatorResult, latest: object) -> bool | None:
-    for key in (
-        "latest_signal_updated",
-        "latest_quality_ok",
-        "latest_input_quality_ok",
-    ):
-        parsed = _optional_bool(result.metadata.get(key))
-        if parsed is not None:
-            return parsed
-    if latest is None:
-        return None
-    try:
-        value = latest["quality_ok"]
-    except (KeyError, TypeError):
-        return None
-    return None if _is_missing(value) else bool(value)
-
-
 def _optional_bool(value: object) -> bool | None:
     if value is None:
         return None
@@ -451,113 +490,11 @@ def _optional_bool(value: object) -> bool | None:
     return bool(value)
 
 
-def _last_accepted_session(result: IndicatorResult, frame: object) -> object:
-    metadata_value = result.metadata.get("last_accepted_session")
-    if metadata_value:
-        return metadata_value
-    if getattr(frame, "empty", True) or "quality_ok" not in frame:
-        return None
-    accepted = frame.index[frame["quality_ok"].fillna(False).astype(bool)]
-    return accepted[-1] if len(accepted) else None
-
-
-def _held_state(last_accepted: object) -> str:
-    if last_accepted:
-        try:
-            accepted = datetime.fromisoformat(str(last_accepted)).strftime("%-d %b %Y")
-            return f"Held · accepted through {accepted}"
-        except ValueError:
-            pass
-    return "Held · latest session withheld"
-
-
-def _number(value: object, decimals: int) -> str:
-    try:
-        number = float(value)
-        return f"{number:,.{decimals}f}" if math.isfinite(number) else "—"
-    except (TypeError, ValueError):
-        return "—"
-
-
-def _percent(value: object) -> str:
-    try:
-        number = float(value)
-        return f"{number:.1%}" if math.isfinite(number) else "—"
-    except (TypeError, ValueError):
-        return "—"
-
-
 def _is_missing(value: object) -> bool:
     try:
         return not math.isfinite(float(value))
     except (TypeError, ValueError):
         return True
-
-
-def _relative_state(
-    value: object,
-    ema19: object,
-    ema39: object,
-    *,
-    include_values: bool = False,
-) -> tuple[str, str]:
-    if any(_is_missing(item) for item in (value, ema19, ema39)):
-        return "Trend unavailable", "neutral"
-    level = float(value)
-    short = float(ema19)
-    long = float(ema39)
-
-    def comparison(name: str, average: float) -> str:
-        if level > average:
-            relation = f"Above {name}"
-        elif level < average:
-            relation = f"Below {name}"
-        else:
-            relation = f"At {name}"
-        return f"{relation} ({average:.2f})" if include_values else relation
-
-    if level > max(short, long):
-        tone = "positive"
-    elif level < min(short, long):
-        tone = "negative"
-    else:
-        tone = "neutral"
-    return f"{comparison('EMA19', short)} · {comparison('EMA39', long)}", tone
-
-
-def _band_state(
-    value: object,
-    low: object,
-    high: object,
-) -> tuple[str, str]:
-    if any(_is_missing(item) for item in (value, low, high)):
-        return "200-day band unavailable", "neutral"
-    level = float(value)
-    if level > float(high):
-        return "Above 200-day band", "positive"
-    if level < float(low):
-        return "Below 200-day band", "negative"
-    return "Inside 200-day band", "neutral"
-
-
-def _sign_tone(value: object) -> str:
-    if _is_missing(value):
-        return "neutral"
-    number = float(value)
-    if number > 0:
-        return "positive"
-    if number < 0:
-        return "negative"
-    return "neutral"
-
-
-def _signal_label(value: object, *, positive: str, negative: str) -> str:
-    tone = _sign_tone(value)
-    if tone == "positive":
-        return positive
-    if tone == "negative":
-        return negative
-    return "Neutral" if not _is_missing(value) else "Unavailable"
 
 
 def _sync_text(
@@ -632,6 +569,88 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
       : value;
     const time = new Date(normalised).getTime();
     return Number.isFinite(time) ? time : null;
+  }};
+
+  const traceValueAt = (trace, targetTime) => {{
+    const xs = trace.x || [];
+    const ys = trace.y || [];
+    for (let index = 0; index < Math.min(xs.length, ys.length); index += 1) {{
+      const time = asTime(xs[index]);
+      const value = Number(ys[index]);
+      if (time !== null && Math.abs(time - targetTime) < 1000
+        && Number.isFinite(value)) return value;
+    }}
+    return null;
+  }};
+
+  const hoverDecimals = trace => {{
+    const match = String(trace.hovertemplate || "").match(/y:[.]([0-9]+)f/);
+    return match ? Number(match[1]) : 2;
+  }};
+
+  const isHoverTrace = trace => {{
+    const meta = trace.meta && typeof trace.meta === "object" ? trace.meta : {{}};
+    return meta.external_hover !== false && trace.hoverinfo !== "skip"
+      && trace.visible !== false && trace.visible !== "legendonly";
+  }};
+
+  const latestHoverTime = plot => {{
+    let latest = null;
+    for (const trace of plot._fullData || []) {{
+      if (!isHoverTrace(trace)) continue;
+      const xs = trace.x || [];
+      const ys = trace.y || [];
+      for (let index = 0; index < Math.min(xs.length, ys.length); index += 1) {{
+        const time = asTime(xs[index]);
+        const value = Number(ys[index]);
+        if (time !== null && Number.isFinite(value)
+          && (latest === null || time > latest)) latest = time;
+      }}
+    }}
+    return latest;
+  }};
+
+  const renderReadout = (plot, targetTime) => {{
+    const readout = document.getElementById(`hover-${{plot.id}}`);
+    if (targetTime === null || !readout) return;
+    const legend = readout.closest(".chart-meta")?.querySelector(".chart-legend");
+    const legendItems = [...(legend?.querySelectorAll(".legend-item") || [])];
+    for (const item of legendItems) {{
+      const valueNode = item.querySelector(".legend-value");
+      if (valueNode) valueNode.textContent = "";
+    }}
+    const date = document.createElement("span");
+    date.className = "hover-date";
+    date.textContent = new Intl.DateTimeFormat("en-AU", {{
+      day: "numeric",
+      month: "short",
+      year: "numeric",
+    }}).format(new Date(targetTime));
+    const seen = new Set();
+    for (const trace of plot._fullData || []) {{
+      const meta = trace.meta && typeof trace.meta === "object" ? trace.meta : {{}};
+      const name = String(meta.external_hover_label
+        || meta.external_legend_label || trace.name || "").trim();
+      if (!name || seen.has(name) || !isHoverTrace(trace)) continue;
+      const value = traceValueAt(trace, targetTime);
+      if (value === null) continue;
+      seen.add(name);
+      const item = legendItems.find(candidate => candidate.dataset.series === name);
+      const valueNode = item?.querySelector(".legend-value");
+      if (!valueNode) continue;
+      valueNode.textContent = value.toLocaleString("en-AU", {{
+        minimumFractionDigits: hoverDecimals(trace),
+        maximumFractionDigits: hoverDecimals(trace),
+      }});
+    }}
+    readout.replaceChildren(date);
+  }};
+
+  const resetHoverReadout = plot => renderReadout(plot, latestHoverTime(plot));
+
+  const updateHoverReadout = (plot, event) => {{
+    const hoveredTime = asTime(event?.points?.[0]?.x);
+    if (hoveredTime !== null) renderReadout(plot, hoveredTime);
   }};
 
   const visibleValues = plot => {{
@@ -714,38 +733,62 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
     return [bounds[0], end.getTime()];
   }};
 
-  let synchronisingX = false;
-  const synchroniseXFrom = source => {{
-    if (synchronisingX) return;
-    const sourceRange = source?._fullLayout?.xaxis?.range?.map(asTime);
-    if (!sourceRange || sourceRange.some(value => value === null)) return;
-    synchronisingX = true;
-    const updates = [];
+  const boundedRange = (plot, requestedRange) => {{
+    const bounds = displayBounds(plot);
+    if (!bounds || !requestedRange || requestedRange.some(value => value === null)) return null;
+    const requestedSpan = requestedRange[1] - requestedRange[0];
+    const fullSpan = bounds[1] - bounds[0];
+    let start = requestedRange[0];
+    let end = requestedRange[1];
+    if (requestedSpan >= fullSpan) return bounds;
+    if (start < bounds[0]) {{ start = bounds[0]; end = start + requestedSpan; }}
+    if (end > bounds[1]) {{ end = bounds[1]; start = end - requestedSpan; }}
+    return [start, end];
+  }};
+
+  let rangeGeneration = 0;
+  let canonicalRange = null;
+  const rangeQueues = new Map();
+  const applyLinkedRange = requestedRange => {{
+    if (!requestedRange || requestedRange.some(value => value === null)) return;
+    canonicalRange = requestedRange.slice();
+    const generation = ++rangeGeneration;
     for (const id of plotIds) {{
       const target = document.getElementById(id);
-      if (!target || target === source) continue;
-      const bounds = displayBounds(target);
-      if (!bounds) continue;
-      const requestedSpan = sourceRange[1] - sourceRange[0];
-      const fullSpan = bounds[1] - bounds[0];
-      let start = sourceRange[0];
-      let end = sourceRange[1];
-      if (requestedSpan >= fullSpan) {{
-        [start, end] = bounds;
-      }} else {{
-        if (start < bounds[0]) {{ start = bounds[0]; end = start + requestedSpan; }}
-        if (end > bounds[1]) {{ end = bounds[1]; start = end - requestedSpan; }}
-      }}
-      target.dataset.syncingX = "1";
-      updates.push(
-        Plotly.relayout(target, {{
-          "xaxis.range": [new Date(start).toISOString(), new Date(end).toISOString()],
+      if (!target) continue;
+      const previous = rangeQueues.get(id) || Promise.resolve();
+      const update = previous.catch(() => undefined).then(() => {{
+        if (generation !== rangeGeneration) return;
+        const targetRange = boundedRange(target, canonicalRange);
+        if (!targetRange) return;
+        target.dataset.syncingX = String(generation);
+        target.dataset.syncRange = JSON.stringify(targetRange);
+        return Plotly.relayout(target, {{
+          "xaxis.range": targetRange.map(value => new Date(value).toISOString()),
         }}).then(() => fitVisibleY(target)).finally(() => {{
-          delete target.dataset.syncingX;
-        }})
-      );
+          if (target.dataset.syncingX === String(generation)) {{
+            delete target.dataset.syncingX;
+            delete target.dataset.syncRange;
+          }}
+        }});
+      }});
+      rangeQueues.set(id, update);
     }}
-    Promise.allSettled(updates).then(() => {{ synchronisingX = false; }});
+  }};
+
+  const isProgrammedRange = plot => {{
+    if (!plot.dataset.syncingX || !plot.dataset.syncRange) return false;
+    const intended = JSON.parse(plot.dataset.syncRange);
+    const current = plot?._fullLayout?.xaxis?.range?.map(asTime);
+    return current && current.every((value, index) =>
+      value !== null && Math.abs(value - intended[index]) < 1000);
+  }};
+
+  const synchroniseXFrom = source => {{
+    const sourceRange = source?._fullLayout?.xaxis?.range?.map(asTime);
+    if (sourceRange && sourceRange.every(value => value !== null)) {{
+      applyLinkedRange(sourceRange);
+    }}
   }};
 
   const attachBoundedWheelZoom = plot => {{
@@ -840,16 +883,48 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
     if (!requested) return;
     const [start, end] = requested;
     setActiveRange(period);
-    source.dataset.rangeControl = "1";
-    Plotly.relayout(source, {{
-      "xaxis.range": [new Date(start).toISOString(), new Date(end).toISOString()],
-    }}).then(() => fitVisibleY(source)).finally(() => {{
-      delete source.dataset.rangeControl;
-    }});
+    applyLinkedRange([start, end]);
   }};
 
   for (const button of rangeButtons) {{
     button.addEventListener("click", () => applyDashboardRange(button.dataset.dashboardRange));
+  }}
+
+  const chartSelectors = [...document.querySelectorAll(".chart-selector")];
+  const chartViews = [...document.querySelectorAll(".chart-view")];
+  const activateChart = button => {{
+    const targetId = button?.dataset.chartTarget;
+    if (!targetId) return;
+    for (const selector of chartSelectors) {{
+      const selected = selector === button;
+      selector.classList.toggle("is-active", selected);
+      selector.setAttribute("aria-pressed", String(selected));
+    }}
+    for (const view of chartViews) {{
+      const selected = view.id === targetId;
+      view.classList.toggle("is-active", selected);
+      view.setAttribute("aria-hidden", String(!selected));
+    }}
+    const plot = document.getElementById(button.dataset.plotId || "");
+    if (plot?._fullLayout) {{
+      requestAnimationFrame(() => {{
+        Plotly.Plots.resize(plot);
+        fitVisibleY(plot);
+      }});
+    }}
+    const pane = document.querySelector(".chart-pane");
+    const shouldScroll = pane && (compactQuery.matches
+      || pane.getBoundingClientRect().top > window.innerHeight);
+    if (shouldScroll) {{
+      const reducedMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+      document.querySelector(".range-control")?.scrollIntoView({{
+        behavior: reducedMotion ? "auto" : "smooth",
+        block: "start",
+      }});
+    }}
+  }};
+  for (const selector of chartSelectors) {{
+    selector.addEventListener("click", () => activateChart(selector));
   }}
 
   const responsiveDefaults = new Map();
@@ -861,15 +936,16 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
       if (!plot?._fullLayout) continue;
       if (!responsiveDefaults.has(id)) {{
         responsiveDefaults.set(id, {{
-          showlegend: Boolean(plot._fullLayout.showlegend),
           marginTop: Number(plot._fullLayout.margin?.t) || 72,
+          marginRight: Number(plot._fullLayout.margin?.r) || 26,
         }});
       }}
       const defaults = responsiveDefaults.get(id);
       updates.push(
         Plotly.relayout(plot, {{
-          "showlegend": compact ? false : defaults.showlegend,
-          "margin.t": compact ? 48 : defaults.marginTop,
+          "showlegend": false,
+          "margin.t": compact ? 20 : defaults.marginTop,
+          "margin.r": compact ? Math.max(42, defaults.marginRight) : defaults.marginRight,
         }}).then(() => {{
           Plotly.Plots.resize(plot);
           return fitVisibleY(plot);
@@ -894,11 +970,12 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
       if (Object.keys(changes).some(key =>
         key === "xaxis.autorange" || key.startsWith("xaxis.range")
       )) {{
-        if (!plot.dataset.syncingX && !plot.dataset.rangeControl) {{
+        const programmed = isProgrammedRange(plot);
+        if (!programmed) {{
           requestAnimationFrame(() => setActiveRange(matchingDashboardRange(plot)));
         }}
         scheduleFit();
-        if (!plot.dataset.syncingX) {{
+        if (!programmed) {{
           requestAnimationFrame(() => synchroniseXFrom(plot));
         }}
       }}
@@ -916,7 +993,10 @@ def _visible_y_script(plot_ids: Sequence[str]) -> str:
         setTimeout(scheduleFit, 50);
       }}
     }});
+    plot.on("plotly_hover", event => updateHoverReadout(plot, event));
+    plot.on("plotly_unhover", () => resetHoverReadout(plot));
     attachBoundedWheelZoom(plot);
+    resetHoverReadout(plot);
     scheduleFit();
   }}
   applyResponsiveLayout();
