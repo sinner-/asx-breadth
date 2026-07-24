@@ -54,7 +54,7 @@ with sync_playwright() as playwright:
     )
     page.goto(html_path.as_uri(), wait_until="load")
     page.wait_for_function(
-        "document.querySelectorAll('.chart-selector').length === 10"
+        "document.querySelectorAll('.chart-selector').length === 14"
         " && document.querySelectorAll('.js-plotly-plot').length > 0"
         " && [...document.querySelectorAll('.js-plotly-plot')]"
         ".every(plot => plot._fullLayout)"
@@ -73,6 +73,28 @@ with sync_playwright() as playwright:
           const geometric = document.getElementById('plot-geometric-index-chart');
           const volatility = document.getElementById('plot-volatility-trend-chart');
           const currency = document.getElementById('plot-currency-index-trend-chart');
+          const smaWindows = [5, 20, 50, 200];
+          const smaCharts = smaWindows.map(window => {
+            const plot = document.getElementById(`plot-percent-above-sma-${window}-chart`);
+            const trace = plot?._fullData.find(
+              item => item.name === `% above ${window}SMA`);
+            const values = (trace?.y || [])
+              .map(Number)
+              .filter(Number.isFinite);
+            return {
+              window,
+              title: document.querySelector(
+                `#view-percent-above-sma-${window}-chart h2`)?.textContent || null,
+              traceName: trace?.name || null,
+              points: values.length,
+              low: values.length ? Math.min(...values) : null,
+              high: values.length ? Math.max(...values) : null,
+              tickSuffix: plot?._fullLayout.yaxis.ticksuffix || null,
+              referenceLines: (plot?._fullLayout.shapes || [])
+                .filter(shape => Number(shape.y0) === 50 && Number(shape.y1) === 50)
+                .length,
+            };
+          });
           const geometricTrace = geometric._fullData.find(
             trace => trace.name === 'Geometric index');
           const rasiData = rasi?._fullData || [];
@@ -213,12 +235,13 @@ with sync_playwright() as playwright:
             currencySeries: currency._fullData
               .filter(trace => [...(trace.y || [])].some(value => Number.isFinite(Number(value))))
               .map(trace => trace.name),
+            smaCharts,
             health: document.querySelector('footer')?.textContent || '',
           };
         }
         """
     )
-    assert 1 <= initial["plots"] <= 10 and initial["kpis"] == 10, initial
+    assert 1 <= initial["plots"] <= 14 and initial["kpis"] == 14, initial
     assert initial["kpiLabels"] == [
         "VAS total return",
         "ASX 300 geometric",
@@ -228,6 +251,10 @@ with sync_playwright() as playwright:
         "New 52-week highs",
         "New 52-week lows",
         "New highs − lows",
+        "% above 5SMA",
+        "% above 20SMA",
+        "% above 50SMA",
+        "% above 200SMA",
         "AXVI",
         "XDA",
     ], initial
@@ -255,12 +282,16 @@ with sync_playwright() as playwright:
     oscillator_detail = initial["kpiDetails"]["McClellan oscillator"]
     assert "Breadth momentum" in oscillator_detail, oscillator_detail
     assert "impulse" not in oscillator_detail.lower(), oscillator_detail
+    for window in (5, 20, 50, 200):
+        label = f"% above {window}SMA"
+        assert initial["kpiValues"][label].endswith("%"), initial
+        assert "eligible above" in initial["kpiDetails"][label], initial
     assert initial["mastheads"] == 0 and initial["footers"] == 1, initial
     assert "holdings as at" in initial["footerText"], initial
     assert "Generated" in initial["footerText"], initial
-    assert initial["selectorCards"] == 10, initial
-    assert initial["sparklineCards"] == 10, initial
-    assert initial["sparklinePeriods"] == ["1Y"] * 10, initial
+    assert initial["selectorCards"] == 14, initial
+    assert initial["sparklineCards"] == 14, initial
+    assert initial["sparklinePeriods"] == ["1Y"] * 14, initial
     assert initial["sparklinePaths"] >= initial["plots"], initial
     assert initial["sparklineColours"]["ASX 300 geometric"] == ["rgb(22, 33, 29)"], (
         initial
@@ -280,7 +311,7 @@ with sync_playwright() as playwright:
         "rgb(17, 17, 17)",
         "rgb(184, 75, 69)",
     }, initial
-    assert initial["chartPanes"] == 1 and initial["chartViews"] == 10, initial
+    assert initial["chartPanes"] == 1 and initial["chartViews"] == 14, initial
     assert initial["activeViews"] == 1 and initial["pressedSelectors"] == 1, initial
     assert initial["maxSelectorHeight"] <= 130, initial
     assert initial["selectorColumns"] == 4, initial
@@ -349,6 +380,15 @@ with sync_playwright() as playwright:
         "39-session EMA",
         "200-session EMA",
     }, initial
+    assert len(initial["smaCharts"]) == 4, initial
+    for chart in initial["smaCharts"]:
+        window = chart["window"]
+        assert chart["title"] == f"% of Stocks Above {window}-Day SMA", chart
+        assert chart["traceName"] == f"% above {window}SMA", chart
+        assert chart["points"] > 0, chart
+        assert 0 <= chart["low"] <= chart["high"] <= 100, chart
+        assert chart["tickSuffix"] == "%", chart
+        assert chart["referenceLines"] == 1, chart
     assert "Cached through" in initial["health"], initial
     rasi_available = any(
         item["id"] == "plot-rasi-chart" for item in initial["defaultReadouts"]
@@ -367,11 +407,17 @@ with sync_playwright() as playwright:
           plot._fullLayout.xaxis.range.map(value => new Date(value).getTime()))
         """
     )
+    reference_span = linked_ranges[0][1] - linked_ranges[0][0]
     for linked in linked_ranges[1:]:
-        # A newer series cannot expose dates before its first honest observation;
-        # it clamps only that left edge while preserving the shared right edge.
-        assert linked[0] >= linked_ranges[0][0] - 1_000, linked_ranges
-        assert abs(linked[1] - linked_ranges[0][1]) < 1_000, linked_ranges
+        # Each chart preserves the requested span when possible, shifting it
+        # inside its own honest bounds if a published series starts later or
+        # is one session behind the benchmark.
+        linked_span = linked[1] - linked[0]
+        assert 0 < linked_span <= reference_span + 1_000, linked_ranges
+        assert linked[1] <= linked_ranges[0][1] + 1_000, linked_ranges
+        assert min(linked[1], linked_ranges[0][1]) > max(
+            linked[0], linked_ranges[0][0]
+        ), linked_ranges
 
     # Rapid range changes are last-action-wins; no in-flight fan-out may drop
     # the final selection for hidden plots.
@@ -392,9 +438,14 @@ with sync_playwright() as playwright:
           plot._fullLayout.xaxis.range.map(value => new Date(value).getTime()))
         """
     )
+    rapid_reference_span = rapid_ranges[0][1] - rapid_ranges[0][0]
     for linked in rapid_ranges[1:]:
-        assert linked[0] >= rapid_ranges[0][0] - 1_000, rapid_ranges
-        assert abs(linked[1] - rapid_ranges[0][1]) < 1_000, rapid_ranges
+        linked_span = linked[1] - linked[0]
+        assert 0 < linked_span <= rapid_reference_span + 1_000, rapid_ranges
+        assert linked[1] <= rapid_ranges[0][1] + 1_000, rapid_ranges
+        assert min(linked[1], rapid_ranges[0][1]) > max(
+            linked[0], rapid_ranges[0][0]
+        ), rapid_ranges
 
     # The one canonical range control remains accessible while inspecting the
     # expanded pane and footer.
@@ -464,7 +515,7 @@ with sync_playwright() as playwright:
 
     # Ordinary wheel input remains page scrolling; only modifier-wheel zoom is
     # captured by the plot.
-    page.evaluate("window.scrollTo(0, 0)")
+    benchmark.scroll_into_view_if_needed()
     page.wait_for_timeout(100)
     box = benchmark.locator(".nsewdrag").bounding_box()
     assert box is not None
@@ -535,11 +586,17 @@ with sync_playwright() as playwright:
     assert default_benchmark_meta.text_content() == expected_benchmark_text
     before_x = benchmark.evaluate("plot => plot._fullLayout.xaxis.range.slice()")
     before_scroll = page.evaluate("window.scrollY")
-    page.mouse.wheel(0, 500)
+    wheel_delta = -300 if before_scroll > 0 else 300
+    page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+    page.mouse.wheel(0, wheel_delta)
     page.wait_for_timeout(250)
     after_x = benchmark.evaluate("plot => plot._fullLayout.xaxis.range.slice()")
     assert before_x == after_x, (before_x, after_x)
-    assert page.evaluate("window.scrollY") > before_scroll
+    after_scroll = page.evaluate("window.scrollY")
+    if wheel_delta < 0:
+        assert after_scroll < before_scroll, (before_scroll, after_scroll)
+    else:
+        assert after_scroll > before_scroll, (before_scroll, after_scroll)
 
     if rasi_available:
         # The transparent real-session carrier supplies one useful external hover;

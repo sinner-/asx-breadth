@@ -7,6 +7,7 @@ import pandas as pd
 import plotly.graph_objects as go
 
 from ..indicators.base import IndicatorResult
+from ..indicators.percent_above_sma import SMA_WINDOWS
 from .base import PanelSummary
 from .summary import (
     band_state,
@@ -586,6 +587,78 @@ class NetNewHighsPanel:
             "NH − NL",
             include_zero=True,
         )
+
+
+class PercentAboveSmaPanel:
+    indicator_key = "percent_above_sma"
+
+    def __init__(self, window: int):
+        if window not in SMA_WINDOWS:
+            raise ValueError(f"Unsupported SMA window: {window}")
+        self.window = window
+        self.key = f"percent-above-sma-{window}-chart"
+        self.title = f"% of Stocks Above {window}-Day SMA"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        label = f"% above {self.window}SMA"
+        if result.frame.empty:
+            return PanelSummary(label, "—", "Unavailable")
+
+        column = f"percent_above_sma_{self.window}"
+        latest = result.frame.iloc[-1]
+        quality_ok = latest_quality(result, latest)
+        display = latest
+        if is_missing(latest[column]):
+            if quality_ok is not False:
+                return PanelSummary(
+                    label,
+                    "—",
+                    f"Insufficient {self.window}-session history",
+                )
+            available = result.frame[result.frame[column].notna()]
+            if available.empty:
+                return PanelSummary(
+                    label, "—", held_state(last_accepted_session(result))
+                )
+            display = available.iloc[-1]
+
+        value = float(display[column])
+        tone = sign_tone(value - 50.0)
+        detail = (
+            f"{number(display[f'above_sma_{self.window}'], 0)} of "
+            f"{number(display[f'eligible_sma_{self.window}'], 0)} eligible above"
+        )
+        if quality_ok is False:
+            detail = held_state(last_accepted_session(result))
+            tone = "neutral"
+        return PanelSummary(label, f"{number(value, 1)}%", detail, tone)
+
+    def figure(self, result: IndicatorResult) -> go.Figure:
+        frame = result.frame
+        column = f"percent_above_sma_{self.window}"
+        label = f"% above {self.window}SMA"
+        figure = go.Figure()
+        figure.add_hline(
+            y=50,
+            line_width=1,
+            line_dash="dot",
+            line_color="rgba(22, 33, 29, 0.28)",
+        )
+        figure.add_trace(
+            go.Scatter(
+                x=frame.index,
+                y=frame[column],
+                name=label,
+                mode="lines",
+                line={"color": COLORS["ink"], "width": 2.2},
+                hovertemplate=f"<b>{label}</b>: %{{y:.1f}}%<extra></extra>",
+                connectgaps=False,
+                meta={"sparkline": True},
+            )
+        )
+        figure = _style(figure, "% of eligible constituents")
+        figure.update_yaxes(ticksuffix="%")
+        return figure
 
 
 def _mcclellan_summary(

@@ -10,6 +10,7 @@ from .charts import (
     NetNewHighsPanel,
     NewHighsPanel,
     NewLowsPanel,
+    PercentAboveSmaPanel,
     RasiPanel,
     VolatilityTrendPanel,
 )
@@ -23,6 +24,7 @@ BUILT_IN_PANELS = (
     NewHighsPanel(),
     NewLowsPanel(),
     NetNewHighsPanel(),
+    *(PercentAboveSmaPanel(window) for window in (5, 20, 50, 200)),
     VolatilityTrendPanel(),
     CurrencyIndexTrendPanel(),
 )
@@ -39,6 +41,7 @@ __all__ = [
     "NewHighsPanel",
     "NewLowsPanel",
     "PanelSummary",
+    "PercentAboveSmaPanel",
     "RasiPanel",
     "VolatilityTrendPanel",
 ]

@@ -7,6 +7,7 @@ from .currency_index_trend import CurrencyIndexTrend
 from .geometric_index import GeometricIndex
 from .mcclellan import RatioAdjustedMcClellan
 from .new_highs_lows import NewHighLow
+from .percent_above_sma import PercentAboveMovingAverages
 from .volatility_trend import VolatilityTrend
 
 BUILT_IN_INDICATORS = (
@@ -17,6 +18,7 @@ BUILT_IN_INDICATORS = (
     AdvanceDecline(),
     RatioAdjustedMcClellan(),
     NewHighLow(),
+    PercentAboveMovingAverages(),
 )
 
 __all__ = [
@@ -27,6 +29,7 @@ __all__ = [
     "GeometricIndex",
     "IndicatorContext",
     "IndicatorResult",
+    "PercentAboveMovingAverages",
     "RatioAdjustedMcClellan",
     "NewHighLow",
     "VolatilityTrend",

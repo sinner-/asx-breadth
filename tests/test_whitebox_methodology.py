@@ -25,6 +25,10 @@ from asx_breadth.indicators.benchmark_trend import BenchmarkTrend
 from asx_breadth.indicators.geometric_index import GeometricIndex
 from asx_breadth.indicators.mcclellan import RatioAdjustedMcClellan
 from asx_breadth.indicators.new_highs_lows import NewHighLow, _price_extremes
+from asx_breadth.indicators.percent_above_sma import (
+    PercentAboveMovingAverages,
+    _total_return_levels,
+)
 from asx_breadth.indicators.quality import session_quality
 from asx_breadth.models import Snapshot, SnapshotInstrument, SnapshotSeries
 
@@ -191,6 +195,119 @@ class WhiteboxMethodologyTests(unittest.TestCase):
         self.assertEqual(result.frame.index[-1], dates[-1])
         self.assertEqual(result.frame.iloc[-1]["new_lows"], 0)
         self.assertIn("total-return-adjusted", result.metadata["price_basis"])
+
+    def test_dividend_price_drop_does_not_create_a_false_sma_break(self) -> None:
+        dates = pd.bdate_range("2026-07-01", periods=6)
+        factors = pd.DataFrame(
+            {
+                "instrument_id": [1] * len(dates),
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "close_to_previous_close": [None, 1.01, 1.01, 1.01, 1.01, 0.95],
+                "total_return_factor": [None, 1.01, 1.01, 1.01, 1.01, 1.0],
+            }
+        )
+
+        result = PercentAboveMovingAverages().calculate(
+            IndicatorContext(
+                snapshot=self.snapshot,
+                factors=factors,
+                series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
+            ),
+            {},
+        )
+
+        latest = result.frame.iloc[-1]
+        self.assertEqual(latest["eligible_sma_5"], 1)
+        self.assertEqual(latest["above_sma_5"], 1)
+        self.assertEqual(latest["percent_above_sma_5"], 100.0)
+        self.assertIn("dividends", result.metadata["price_basis"])
+
+    def test_sma_chain_restarts_and_requires_a_fresh_full_window(self) -> None:
+        dates = pd.bdate_range("2026-07-01", periods=11)
+        factors = pd.DataFrame(
+            {
+                "instrument_id": [1] * len(dates),
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "total_return_factor": [
+                    None,
+                    1.01,
+                    1.01,
+                    1.01,
+                    1.01,
+                    None,
+                    1.01,
+                    1.01,
+                    1.01,
+                    1.01,
+                    1.01,
+                ],
+            }
+        )
+
+        levels = _total_return_levels(factors)
+        result = PercentAboveMovingAverages().calculate(
+            IndicatorContext(
+                snapshot=self.snapshot,
+                factors=factors,
+                series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
+            ),
+            {},
+        )
+
+        self.assertTrue(pd.isna(levels.loc[5, "total_return_level"]))
+        self.assertEqual(levels.loc[6, "total_return_level"], 100.0)
+        self.assertEqual(levels.loc[5, "chain_id"] + 1, levels.loc[6, "chain_id"])
+        self.assertEqual(result.frame.loc[dates[9], "eligible_sma_5"], 0)
+        self.assertEqual(result.frame.loc[dates[10], "eligible_sma_5"], 1)
+
+    def test_sma_breadth_withholds_a_broad_quote_outage(self) -> None:
+        dates = pd.bdate_range("2026-07-01", periods=6)
+        instruments = tuple(
+            SnapshotInstrument(index, f"S{index}", f"S{index}.AX", f"Stock {index}")
+            for index in range(1, 26)
+        )
+        snapshot = Snapshot(
+            snapshot_id=8,
+            universe_code="TEST",
+            universe_name="Test universe",
+            as_of_date=date(2026, 6, 30),
+            source_path="holdings.xlsx",
+            instruments=instruments,
+        )
+        rows: list[dict[str, object]] = []
+        for instrument in instruments:
+            instrument_dates = dates if instrument.instrument_id <= 5 else dates[:-1]
+            for position, trade_date in enumerate(instrument_dates):
+                rows.append(
+                    {
+                        "instrument_id": instrument.instrument_id,
+                        "trade_date": trade_date,
+                        "previous_trade_date": (
+                            instrument_dates[position - 1] if position else pd.NaT
+                        ),
+                        "total_return_factor": 1.01 if position else None,
+                    }
+                )
+
+        frame = (
+            PercentAboveMovingAverages()
+            .calculate(
+                IndicatorContext(
+                    snapshot=snapshot,
+                    factors=pd.DataFrame(rows),
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
+                ),
+                {},
+            )
+            .frame
+        )
+
+        self.assertTrue(frame.loc[dates[-2], "quality_ok"])
+        self.assertEqual(frame.loc[dates[-2], "percent_above_sma_5"], 100.0)
+        self.assertFalse(frame.loc[dates[-1], "quality_ok"])
+        self.assertTrue(pd.isna(frame.loc[dates[-1], "percent_above_sma_5"]))
 
     def test_mcclellan_exposes_held_state_and_last_accepted_session(self) -> None:
         dates = pd.to_datetime(["2026-07-01", "2026-07-02"])

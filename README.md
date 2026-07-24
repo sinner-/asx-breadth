@@ -5,8 +5,10 @@ total-return trend and hysteresis band with a Value Line-style ASX 300 geometric
 total-return index, the Australian Dollar Currency Index (XDA) with 19/39/200-session
 EMAs, the S&P/ASX 200 VIX (AXVI) and its 200-session EMA,
 advance/decline breadth, the McClellan oscillator and Ratio-Adjusted Summation Index
-(RASI), and 52-week highs, lows, and NH-NL. The storage and plugin boundaries remain
-deliberately broader so further breadth families can be added without replacing ingestion.
+(RASI), 52-week highs, lows, and NH-NL, plus the percentage of constituents above
+their 5-, 20-, 50-, and 200-session simple moving averages. The storage and plugin
+boundaries remain deliberately broader so further breadth families can be added without
+replacing ingestion.
 
 ## Run it
 
@@ -23,7 +25,7 @@ This creates:
 - `data/asx_breadth.sqlite3` — the incremental cache
 - `dashboard.html` — a self-contained interactive Plotly dashboard
 
-Open the dashboard directly in a browser. The ten compact cards are chart selectors with
+Open the dashboard directly in a browser. The fourteen compact cards are chart selectors with
 252-session sparklines; selecting one swaps it into the single expanded chart pane. Drag zoom,
 range buttons, and Ctrl/Command + wheel work horizontally on dates and stay linked across
 chart changes. The dashboard opens on the latest year by default. An ordinary wheel keeps
@@ -100,6 +102,7 @@ src/asx_breadth/
     advance_decline.py           consecutive-session A/D
     mcclellan.py                 ratio-adjusted oscillator and summation
     new_highs_lows.py            52-week highs, lows, and NH-NL
+    percent_above_sma.py         participation above 5/20/50/200-session SMAs
   panels/
     base.py                      dashboard panel and summary protocol
     charts.py                    Plotly VAS trend, A/D, McClellan, and NH-NL cards
@@ -189,6 +192,13 @@ requires changes to Yahoo synchronisation.
   Pre-entry prices can satisfy that warm-up, but an issue is counted only while active.
   NH-NL is the daily new-high count minus the new-low count. It uses the same active-universe
   quote-quality gate as A/D, separately from the count of issues with sufficient long history.
+- Percent-above-SMA breadth reconstructs an arbitrary-scale total-return level for each
+  constituent from the append-stable adjusted-close factors. A stock enters a 5-, 20-, 50-,
+  or 200-session denominator only when it is active, has a quote for that session, and has
+  completed the full SMA history inside an unbroken factor chain. This prevents splits and
+  ex-dividend price drops from manufacturing false moving-average breaks. A bad chain can
+  restart on a later valid quote, but must earn a fresh full window; broad quote outages are
+  withheld by the shared coverage policy.
 
 `yfinance` is an unofficial client for Yahoo Finance. Its `repair=True` mode is enabled to
 address known missing-price, split, dividend, and unit errors. The downloader uses small
@@ -214,7 +224,8 @@ The tests cover workbook admission, effective-dated composition changes, persist
 transition syncing, audited factor repair, response-anchor/history validation, benchmark
 session policy, role-based market-series caching, AXVI level reconstruction, gap/halt and coverage
 policy, RASI state, point-in-time new-high/low eligibility, and horizontal-only chart
-configuration. The committed browser smoke check exercises the generated report's linked
+configuration, including total-return-adjusted SMA participation and broken-chain warm-up.
+The committed browser smoke check exercises the generated report's linked
 zoom, sticky date controls, visible-range y fitting, exact bicolour RASI and AXVI regimes,
 external hover readouts, responsive legends, viewport changes, and accessibility wiring. It
 uses Chromium by default and Firefox when `DASHBOARD_BROWSER=firefox`; generate

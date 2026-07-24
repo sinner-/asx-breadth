@@ -52,6 +52,7 @@ from asx_breadth.models import (  # noqa: E402
 from asx_breadth.panels.charts import (  # noqa: E402
     AdvanceDeclinePanel,
     CurrencyIndexTrendPanel,
+    PercentAboveSmaPanel,
     VolatilityTrendPanel,
     _ema_regime_paths,
     _signed_rasi_paths,
@@ -71,6 +72,33 @@ class DashboardTests(unittest.TestCase):
             relative_state(110.0, 108.97, 108.68),
             ("Above EMA19 · Above EMA39", "positive"),
         )
+
+    def test_percent_above_sma_panel_is_bounded_data_not_status(self) -> None:
+        dates = pd.bdate_range("2026-07-01", periods=2)
+        result = IndicatorResult(
+            key="percent_above_sma",
+            title="Stocks Above Moving Averages",
+            frame=pd.DataFrame(
+                {
+                    "above_sma_20": [7, 8],
+                    "eligible_sma_20": [10, 10],
+                    "percent_above_sma_20": [70.0, 80.0],
+                    "quality_ok": [True, True],
+                },
+                index=dates,
+            ),
+        )
+
+        panel = PercentAboveSmaPanel(20)
+        figure = panel.figure(result)
+        summary = panel.summary(result)
+
+        self.assertEqual(panel.title, "% of Stocks Above 20-Day SMA")
+        self.assertEqual(summary.value, "80.0%")
+        self.assertEqual(summary.detail, "8 of 10 eligible above")
+        self.assertEqual([trace.name for trace in figure.data], ["% above 20SMA"])
+        self.assertTrue(figure.layout.yaxis.fixedrange)
+        self.assertEqual(figure.layout.yaxis.ticksuffix, "%")
 
 
 class IndicatorRunnerTests(unittest.TestCase):
