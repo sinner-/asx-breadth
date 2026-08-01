@@ -8,7 +8,9 @@ advance/decline breadth, the McClellan oscillator and Ratio-Adjusted Summation I
 (RASI), 52-week highs, lows, and NH-NL, plus the percentage of constituents above
 their 5-, 20-, 50-, and 200-session simple moving averages. The storage and plugin
 boundaries remain deliberately broader so further breadth families can be added without
-replacing ingestion.
+replacing ingestion. Equal-weight realized-dispersion views compare average constituent
+volatility with VAS volatility over 21, 63, and 120 sessions; matching correlation views
+average pairwise Pearson correlations over the same horizons.
 
 ## Run it
 
@@ -25,7 +27,7 @@ This creates:
 - `data/asx_breadth.sqlite3` — the incremental cache
 - `dashboard.html` — a self-contained interactive Plotly dashboard
 
-Open the dashboard directly in a browser. The fourteen compact cards are chart selectors with
+Open the dashboard directly in a browser. The twenty compact cards are chart selectors with
 252-session sparklines; selecting one swaps it into the single expanded chart pane. Drag zoom,
 range buttons, and Ctrl/Command + wheel work horizontally on dates and stay linked across
 chart changes. The dashboard opens on the latest year by default. An ordinary wheel keeps
@@ -103,6 +105,9 @@ src/asx_breadth/
     mcclellan.py                 ratio-adjusted oscillator and summation
     new_highs_lows.py            52-week highs, lows, and NH-NL
     percent_above_sma.py         participation above 5/20/50/200-session SMAs
+    realized.py                  shared valid one-session total-return preparation
+    realized_dispersion.py       equal-weight 21/63/120-session realized dispersion
+    average_correlation.py       average pairwise 21/63/120-session correlation
   panels/
     base.py                      dashboard panel and summary protocol
     charts.py                    Plotly VAS trend, A/D, McClellan, and NH-NL cards
@@ -199,6 +204,22 @@ requires changes to Yahoo synchronisation.
   ex-dividend price drops from manufacturing false moving-average breaks. A bad chain can
   restart on a later valid quote, but must earn a fresh full window; broad quote outages are
   withheld by the shared coverage policy.
+- Realized dispersion uses consecutive-session adjusted-close log returns. For each 21-,
+  63-, and 120-session window, each eligible stock's sample volatility is annualized by
+  `sqrt(252)`. Constituent volatility is the equal-weight arithmetic mean of those
+  individual volatilities; VAS volatility is calculated over the same window. The displayed
+  dispersion is `average constituent volatility - VAS volatility`, in annualized volatility
+  points. Pre-membership history may warm a stock's window, but only active
+  constituents enter the current cross-section. Missing and multi-session returns are
+  excluded without discarding older valid one-session observations, and the shared coverage
+  gate withholds broad outages.
+- Average correlation is the equal-weight arithmetic mean of every eligible active-stock
+  pair's Pearson correlation over its latest 21, 63, or 120 synchronous valid one-session
+  simple total returns. The result is expressed as a percentage from -100% to 100%. Each pair is
+  estimated directly rather than inferred from VAS variance, and pre-membership returns may
+  warm a pair's window while only pairs active on the displayed session enter the average.
+  Missing and multi-session returns are skipped pair-by-pair, so an isolated halt does not
+  invalidate unrelated pairs or permanently break the rolling series.
 
 `yfinance` is an unofficial client for Yahoo Finance. Its `repair=True` mode is enabled to
 address known missing-price, split, dividend, and unit errors. The downloader uses small
@@ -224,7 +245,8 @@ The tests cover workbook admission, effective-dated composition changes, persist
 transition syncing, audited factor repair, response-anchor/history validation, benchmark
 session policy, role-based market-series caching, AXVI level reconstruction, gap/halt and coverage
 policy, RASI state, point-in-time new-high/low eligibility, and horizontal-only chart
-configuration, including total-return-adjusted SMA participation and broken-chain warm-up.
+configuration, including total-return-adjusted SMA participation, broken-chain warm-up,
+controlled realized-dispersion cases, pairwise Pearson arithmetic, and halt recovery.
 The committed browser smoke check exercises the generated report's linked
 zoom, sticky date controls, visible-range y fitting, exact bicolour RASI and AXVI regimes,
 external hover readouts, responsive legends, viewport changes, and accessibility wiring. It

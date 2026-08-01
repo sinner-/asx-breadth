@@ -15,11 +15,13 @@ import unittest
 from datetime import date
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from asx_breadth.indicators.advance_decline import AdvanceDecline
+from asx_breadth.indicators.average_correlation import AverageCorrelation
 from asx_breadth.indicators.base import IndicatorContext, IndicatorResult
 from asx_breadth.indicators.benchmark_trend import BenchmarkTrend
 from asx_breadth.indicators.geometric_index import GeometricIndex
@@ -30,6 +32,7 @@ from asx_breadth.indicators.percent_above_sma import (
     _total_return_levels,
 )
 from asx_breadth.indicators.quality import session_quality
+from asx_breadth.indicators.realized_dispersion import RealizedDispersion
 from asx_breadth.models import Snapshot, SnapshotInstrument, SnapshotSeries
 
 
@@ -308,6 +311,268 @@ class WhiteboxMethodologyTests(unittest.TestCase):
         self.assertEqual(frame.loc[dates[-2], "percent_above_sma_5"], 100.0)
         self.assertFalse(frame.loc[dates[-1], "quality_ok"])
         self.assertTrue(pd.isna(frame.loc[dates[-1], "percent_above_sma_5"]))
+
+    def test_identical_stock_and_index_returns_have_zero_dispersion(self) -> None:
+        dates = pd.bdate_range("2026-01-01", periods=121)
+        factors = [None, *(1.01 if index % 2 else 0.99 for index in range(1, 121))]
+        rows = pd.DataFrame(
+            {
+                "instrument_id": [1] * len(dates),
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "total_return_factor": factors,
+            }
+        )
+        benchmark = rows.drop(columns="instrument_id")
+
+        frame = (
+            RealizedDispersion()
+            .calculate(
+                IndicatorContext(
+                    snapshot=self.snapshot,
+                    factors=rows,
+                    series_factors={"benchmark": benchmark},
+                ),
+                {},
+            )
+            .frame
+        )
+
+        for window in (21, 63, 120):
+            latest = frame.iloc[-1]
+            self.assertAlmostEqual(
+                latest[f"average_stock_vol_{window}"],
+                latest[f"index_vol_{window}"],
+            )
+            self.assertAlmostEqual(latest[f"dispersion_{window}"], 0.0)
+
+    def test_dispersion_is_average_stock_vol_minus_index_vol(self) -> None:
+        dates = pd.bdate_range("2026-06-01", periods=22)
+        stock_factors = {
+            1: [None, *(1.03 if index % 2 else 0.97 for index in range(1, 22))],
+            2: [None, *(0.99 if index % 2 else 1.01 for index in range(1, 22))],
+        }
+        rows = [
+            {
+                "instrument_id": instrument_id,
+                "trade_date": trade_date,
+                "previous_trade_date": dates[position - 1] if position else pd.NaT,
+                "total_return_factor": factors[position],
+            }
+            for instrument_id, factors in stock_factors.items()
+            for position, trade_date in enumerate(dates)
+        ]
+        index_factors = [
+            None,
+            *(1.002 if index % 2 else 0.998 for index in range(1, 22)),
+        ]
+        benchmark = pd.DataFrame(
+            {
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "total_return_factor": index_factors,
+            }
+        )
+        snapshot = Snapshot(
+            snapshot_id=9,
+            universe_code="TEST",
+            universe_name="Test universe",
+            as_of_date=date(2026, 5, 29),
+            source_path="holdings.xlsx",
+            instruments=(
+                self.instrument,
+                SnapshotInstrument(2, "BBB", "BBB.AX", "BBB"),
+            ),
+        )
+
+        latest = (
+            RealizedDispersion()
+            .calculate(
+                IndicatorContext(
+                    snapshot=snapshot,
+                    factors=pd.DataFrame(rows),
+                    series_factors={"benchmark": benchmark},
+                ),
+                {},
+            )
+            .frame.iloc[-1]
+        )
+
+        stock_vols = [
+            pd.Series(np.log(factors[1:])).std(ddof=1) * np.sqrt(252) * 100
+            for factors in stock_factors.values()
+        ]
+        index_vol = (
+            pd.Series(np.log(index_factors[1:])).std(ddof=1) * np.sqrt(252) * 100
+        )
+        average_stock_vol = np.mean(stock_vols)
+        expected_dispersion = average_stock_vol - index_vol
+        self.assertAlmostEqual(latest["average_stock_vol_21"], average_stock_vol)
+        self.assertAlmostEqual(latest["index_vol_21"], index_vol)
+        self.assertAlmostEqual(latest["dispersion_21"], expected_dispersion)
+        self.assertEqual(latest["eligible_issues_21"], 2)
+
+    def test_halt_does_not_poison_later_dispersion_windows(self) -> None:
+        dates = pd.bdate_range("2026-05-01", periods=25)
+        rows: list[dict[str, object]] = []
+        for instrument_id in (1, 2):
+            instrument_dates = dates if instrument_id == 1 else dates.delete(10)
+            for position, trade_date in enumerate(instrument_dates):
+                rows.append(
+                    {
+                        "instrument_id": instrument_id,
+                        "trade_date": trade_date,
+                        "previous_trade_date": (
+                            instrument_dates[position - 1] if position else pd.NaT
+                        ),
+                        "total_return_factor": (
+                            None if position == 0 else 1.01 + 0.001 * (position % 2)
+                        ),
+                    }
+                )
+        benchmark = pd.DataFrame(
+            {
+                "trade_date": dates,
+                "previous_trade_date": [pd.NaT, *dates[:-1]],
+                "total_return_factor": [
+                    None,
+                    *(1.001 + 0.0001 * (index % 2) for index in range(1, 25)),
+                ],
+            }
+        )
+        snapshot = Snapshot(
+            snapshot_id=10,
+            universe_code="TEST",
+            universe_name="Test universe",
+            as_of_date=date(2026, 4, 30),
+            source_path="holdings.xlsx",
+            instruments=(
+                self.instrument,
+                SnapshotInstrument(2, "BBB", "BBB.AX", "BBB"),
+            ),
+        )
+
+        frame = (
+            RealizedDispersion()
+            .calculate(
+                IndicatorContext(
+                    snapshot=snapshot,
+                    factors=pd.DataFrame(rows),
+                    series_factors={"benchmark": benchmark},
+                ),
+                {},
+            )
+            .frame
+        )
+
+        self.assertEqual(frame.loc[dates[10], "quoted_issues"], 1)
+        self.assertEqual(frame.loc[dates[11], "quoted_issues"], 1)
+        self.assertTrue(frame.loc[dates[11], "quality_ok"])
+        self.assertEqual(frame.iloc[-1]["eligible_issues_21"], 2)
+        self.assertTrue(pd.notna(frame.iloc[-1]["dispersion_21"]))
+
+    def test_average_correlation_is_mean_of_pairwise_pearson_coefficients(
+        self,
+    ) -> None:
+        dates = pd.bdate_range("2026-06-01", periods=22)
+        base_returns = np.array([0.01, -0.015, 0.005, 0.02, -0.01, 0.012, -0.004] * 3)
+        log_returns = {
+            1: base_returns,
+            2: base_returns,
+            3: -base_returns,
+        }
+        rows = [
+            {
+                "instrument_id": instrument_id,
+                "trade_date": trade_date,
+                "previous_trade_date": dates[position - 1] if position else pd.NaT,
+                "total_return_factor": (
+                    None if position == 0 else 1.0 + returns[position - 1]
+                ),
+            }
+            for instrument_id, returns in log_returns.items()
+            for position, trade_date in enumerate(dates)
+        ]
+        snapshot = Snapshot(
+            snapshot_id=11,
+            universe_code="TEST",
+            universe_name="Test universe",
+            as_of_date=date(2026, 5, 29),
+            source_path="holdings.xlsx",
+            instruments=(
+                self.instrument,
+                SnapshotInstrument(2, "BBB", "BBB.AX", "BBB"),
+                SnapshotInstrument(3, "CCC", "CCC.AX", "CCC"),
+            ),
+        )
+
+        latest = (
+            AverageCorrelation()
+            .calculate(
+                IndicatorContext(
+                    snapshot=snapshot,
+                    factors=pd.DataFrame(rows),
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
+                ),
+                {},
+            )
+            .frame.iloc[-1]
+        )
+
+        # The three pairs are +1, -1, and -1: their arithmetic mean is -1/3.
+        self.assertAlmostEqual(latest["average_correlation_21"], -100.0 / 3.0)
+        self.assertEqual(latest["eligible_issues_21"], 3)
+        self.assertEqual(latest["eligible_pairs_21"], 3)
+
+    def test_halt_does_not_poison_later_average_correlation(self) -> None:
+        dates = pd.bdate_range("2026-05-01", periods=26)
+        rows: list[dict[str, object]] = []
+        for instrument_id in (1, 2):
+            instrument_dates = dates if instrument_id == 1 else dates.delete(10)
+            for position, trade_date in enumerate(instrument_dates):
+                simple_return = 0.005 * ((position % 5) - 2)
+                rows.append(
+                    {
+                        "instrument_id": instrument_id,
+                        "trade_date": trade_date,
+                        "previous_trade_date": (
+                            instrument_dates[position - 1] if position else pd.NaT
+                        ),
+                        "total_return_factor": (
+                            None if position == 0 else 1.0 + simple_return
+                        ),
+                    }
+                )
+        snapshot = Snapshot(
+            snapshot_id=12,
+            universe_code="TEST",
+            universe_name="Test universe",
+            as_of_date=date(2026, 4, 30),
+            source_path="holdings.xlsx",
+            instruments=(
+                self.instrument,
+                SnapshotInstrument(2, "BBB", "BBB.AX", "BBB"),
+            ),
+        )
+
+        frame = (
+            AverageCorrelation()
+            .calculate(
+                IndicatorContext(
+                    snapshot=snapshot,
+                    factors=pd.DataFrame(rows),
+                    series_factors={"benchmark": pd.DataFrame({"trade_date": dates})},
+                ),
+                {},
+            )
+            .frame
+        )
+
+        self.assertEqual(frame.loc[dates[10], "quoted_issues"], 1)
+        self.assertEqual(frame.loc[dates[11], "quoted_issues"], 1)
+        self.assertEqual(frame.iloc[-1]["eligible_issues_21"], 2)
+        self.assertEqual(frame.iloc[-1]["eligible_pairs_21"], 1)
+        self.assertTrue(pd.notna(frame.iloc[-1]["average_correlation_21"]))
 
     def test_mcclellan_exposes_held_state_and_last_accepted_session(self) -> None:
         dates = pd.to_datetime(["2026-07-01", "2026-07-02"])

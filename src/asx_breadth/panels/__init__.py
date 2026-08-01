@@ -3,6 +3,7 @@
 from .base import DashboardPanel, PanelSummary
 from .charts import (
     AdvanceDeclinePanel,
+    AverageCorrelationPanel,
     BenchmarkTrendPanel,
     CurrencyIndexTrendPanel,
     GeometricIndexPanel,
@@ -12,6 +13,7 @@ from .charts import (
     NewLowsPanel,
     PercentAboveSmaPanel,
     RasiPanel,
+    RealizedDispersionPanel,
     VolatilityTrendPanel,
 )
 
@@ -25,6 +27,8 @@ BUILT_IN_PANELS = (
     NewLowsPanel(),
     NetNewHighsPanel(),
     *(PercentAboveSmaPanel(window) for window in (5, 20, 50, 200)),
+    *(RealizedDispersionPanel(window) for window in (21, 63, 120)),
+    *(AverageCorrelationPanel(window) for window in (21, 63, 120)),
     VolatilityTrendPanel(),
     CurrencyIndexTrendPanel(),
 )
@@ -32,6 +36,7 @@ BUILT_IN_PANELS = (
 __all__ = [
     "BUILT_IN_PANELS",
     "AdvanceDeclinePanel",
+    "AverageCorrelationPanel",
     "BenchmarkTrendPanel",
     "CurrencyIndexTrendPanel",
     "DashboardPanel",
@@ -43,5 +48,6 @@ __all__ = [
     "PanelSummary",
     "PercentAboveSmaPanel",
     "RasiPanel",
+    "RealizedDispersionPanel",
     "VolatilityTrendPanel",
 ]

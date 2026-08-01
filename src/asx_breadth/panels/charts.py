@@ -6,8 +6,10 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 
+from ..indicators.average_correlation import CORRELATION_WINDOWS
 from ..indicators.base import IndicatorResult
 from ..indicators.percent_above_sma import SMA_WINDOWS
+from ..indicators.realized_dispersion import DISPERSION_WINDOWS
 from .base import PanelSummary
 from .summary import (
     band_state,
@@ -24,7 +26,6 @@ from .summary import (
     sign_tone,
     signal_label,
 )
-
 
 COLORS = {
     "ink": "#16211d",
@@ -657,6 +658,141 @@ class PercentAboveSmaPanel:
             )
         )
         figure = _style(figure, "% of eligible constituents")
+        figure.update_yaxes(ticksuffix="%")
+        return figure
+
+
+class RealizedDispersionPanel:
+    indicator_key = "realized_dispersion"
+
+    def __init__(self, window: int):
+        if window not in DISPERSION_WINDOWS:
+            raise ValueError(f"Unsupported dispersion window: {window}")
+        self.window = window
+        self.key = f"realized-dispersion-{window}-chart"
+        self.title = f"{window}-Day Realized Dispersion"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        label = f"{self.window}d dispersion"
+        if result.frame.empty:
+            return PanelSummary(label, "—", "Unavailable", "ink")
+
+        column = f"dispersion_{self.window}"
+        latest = result.frame.iloc[-1]
+        quality_ok = latest_quality(result, latest)
+        display = latest
+        if is_missing(latest[column]):
+            if quality_ok is not False:
+                return PanelSummary(
+                    label,
+                    "—",
+                    f"Insufficient {self.window}-session history",
+                    "ink",
+                )
+            available = result.frame[result.frame[column].notna()]
+            if available.empty:
+                return PanelSummary(
+                    label,
+                    "—",
+                    held_state(last_accepted_session(result)),
+                    "ink",
+                )
+            display = available.iloc[-1]
+
+        detail = (
+            f"Avg stock {number(display[f'average_stock_vol_{self.window}'], 1)}% · "
+            f"VAS {number(display[f'index_vol_{self.window}'], 1)}% · "
+            f"{number(display[f'eligible_issues_{self.window}'], 0)} names"
+        )
+        if quality_ok is False:
+            detail = held_state(last_accepted_session(result))
+        return PanelSummary(
+            label,
+            f"{number(display[column], 1)}%",
+            detail,
+            "ink",
+        )
+
+    def figure(self, result: IndicatorResult) -> go.Figure:
+        frame = result.frame
+        figure = go.Figure()
+        _add_line_trace(
+            figure,
+            frame,
+            column=f"dispersion_{self.window}",
+            label="Dispersion",
+            colour=COLORS["green"],
+            width=2.5,
+            sparkline=True,
+        )
+        figure = _style(figure, "Average stock vol minus VAS vol")
+        figure.update_yaxes(ticksuffix="%")
+        return figure
+
+
+class AverageCorrelationPanel:
+    indicator_key = "average_correlation"
+
+    def __init__(self, window: int):
+        if window not in CORRELATION_WINDOWS:
+            raise ValueError(f"Unsupported correlation window: {window}")
+        self.window = window
+        self.key = f"average-correlation-{window}-chart"
+        self.title = f"{window}-Day Average Stock Correlation"
+
+    def summary(self, result: IndicatorResult) -> PanelSummary:
+        label = f"{self.window}d avg correlation"
+        if result.frame.empty:
+            return PanelSummary(label, "—", "Unavailable", "ink")
+
+        column = f"average_correlation_{self.window}"
+        latest = result.frame.iloc[-1]
+        quality_ok = latest_quality(result, latest)
+        display = latest
+        if is_missing(latest[column]):
+            if quality_ok is not False:
+                return PanelSummary(
+                    label,
+                    "—",
+                    f"Insufficient {self.window}-session pair history",
+                    "ink",
+                )
+            available = result.frame[result.frame[column].notna()]
+            if available.empty:
+                return PanelSummary(
+                    label,
+                    "—",
+                    held_state(last_accepted_session(result)),
+                    "ink",
+                )
+            display = available.iloc[-1]
+
+        detail = (
+            f"{number(display[f'eligible_issues_{self.window}'], 0)} stocks · "
+            f"{number(display[f'eligible_pairs_{self.window}'], 0)} pairs"
+        )
+        if quality_ok is False:
+            detail = held_state(last_accepted_session(result))
+        return PanelSummary(
+            label,
+            f"{number(display[column], 1)}%",
+            detail,
+            "ink",
+        )
+
+    def figure(self, result: IndicatorResult) -> go.Figure:
+        frame = result.frame
+        figure = go.Figure()
+        _add_line_trace(
+            figure,
+            frame,
+            column=f"average_correlation_{self.window}",
+            label="Average correlation",
+            colour=COLORS["blue"],
+            width=2.5,
+            sparkline=True,
+        )
+        figure = _style(figure, "Average pairwise Pearson correlation")
         figure.update_yaxes(ticksuffix="%")
         return figure
 

@@ -51,8 +51,10 @@ from asx_breadth.models import (  # noqa: E402
 )
 from asx_breadth.panels.charts import (  # noqa: E402
     AdvanceDeclinePanel,
+    AverageCorrelationPanel,
     CurrencyIndexTrendPanel,
     PercentAboveSmaPanel,
+    RealizedDispersionPanel,
     VolatilityTrendPanel,
     _ema_regime_paths,
     _signed_rasi_paths,
@@ -98,6 +100,59 @@ class DashboardTests(unittest.TestCase):
         self.assertEqual(summary.detail, "8 of 10 eligible above")
         self.assertEqual([trace.name for trace in figure.data], ["% above 20SMA"])
         self.assertTrue(figure.layout.yaxis.fixedrange)
+        self.assertEqual(figure.layout.yaxis.ticksuffix, "%")
+
+    def test_realized_dispersion_panel_shows_only_dispersion_series(self) -> None:
+        dates = pd.bdate_range("2026-07-01", periods=2)
+        result = IndicatorResult(
+            key="realized_dispersion",
+            title="Realized Dispersion",
+            frame=pd.DataFrame(
+                {
+                    "dispersion_63": [16.0, 18.5],
+                    "average_stock_vol_63": [24.0, 25.5],
+                    "index_vol_63": [14.0, 15.2],
+                    "eligible_issues_63": [297, 298],
+                    "quality_ok": [True, True],
+                },
+                index=dates,
+            ),
+        )
+
+        panel = RealizedDispersionPanel(63)
+        figure = panel.figure(result)
+        summary = panel.summary(result)
+
+        self.assertEqual(panel.title, "63-Day Realized Dispersion")
+        self.assertEqual(summary.value, "18.5%")
+        self.assertEqual(summary.detail, "Avg stock 25.5% · VAS 15.2% · 298 names")
+        self.assertEqual([trace.name for trace in figure.data], ["Dispersion"])
+        self.assertEqual(figure.layout.yaxis.ticksuffix, "%")
+
+    def test_average_correlation_panel_shows_one_pearson_series(self) -> None:
+        dates = pd.bdate_range("2026-07-01", periods=2)
+        result = IndicatorResult(
+            key="average_correlation",
+            title="Average Stock Correlation",
+            frame=pd.DataFrame(
+                {
+                    "average_correlation_63": [31.0, 34.5],
+                    "eligible_issues_63": [297, 298],
+                    "eligible_pairs_63": [43_956, 44_253],
+                    "quality_ok": [True, True],
+                },
+                index=dates,
+            ),
+        )
+
+        panel = AverageCorrelationPanel(63)
+        figure = panel.figure(result)
+        summary = panel.summary(result)
+
+        self.assertEqual(panel.title, "63-Day Average Stock Correlation")
+        self.assertEqual(summary.value, "34.5%")
+        self.assertEqual(summary.detail, "298 stocks · 44,253 pairs")
+        self.assertEqual([trace.name for trace in figure.data], ["Average correlation"])
         self.assertEqual(figure.layout.yaxis.ticksuffix, "%")
 
 

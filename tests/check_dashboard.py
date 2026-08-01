@@ -54,7 +54,7 @@ with sync_playwright() as playwright:
     )
     page.goto(html_path.as_uri(), wait_until="load")
     page.wait_for_function(
-        "document.querySelectorAll('.chart-selector').length === 14"
+        "document.querySelectorAll('.chart-selector').length === 20"
         " && document.querySelectorAll('.js-plotly-plot').length > 0"
         " && [...document.querySelectorAll('.js-plotly-plot')]"
         ".every(plot => plot._fullLayout)"
@@ -93,6 +93,49 @@ with sync_playwright() as playwright:
               referenceLines: (plot?._fullLayout.shapes || [])
                 .filter(shape => Number(shape.y0) === 50 && Number(shape.y1) === 50)
                 .length,
+            };
+          });
+          const dispersionWindows = [21, 63, 120];
+          const dispersionCharts = dispersionWindows.map(window => {
+            const plot = document.getElementById(
+              `plot-realized-dispersion-${window}-chart`);
+            const finiteSeries = (plot?._fullData || [])
+              .filter(trace => [...(trace.y || [])]
+                .some(value => Number.isFinite(Number(value))))
+              .map(trace => trace.name);
+            const dispersion = plot?._fullData.find(
+              trace => trace.name === 'Dispersion');
+            const values = (dispersion?.y || []).map(Number).filter(Number.isFinite);
+            return {
+              window,
+              title: document.querySelector(
+                `#view-realized-dispersion-${window}-chart h2`)?.textContent || null,
+              series: finiteSeries,
+              points: values.length,
+              low: values.length ? Math.min(...values) : null,
+              tickSuffix: plot?._fullLayout.yaxis.ticksuffix || null,
+            };
+          });
+          const correlationWindows = [21, 63, 120];
+          const correlationCharts = correlationWindows.map(window => {
+            const plot = document.getElementById(
+              `plot-average-correlation-${window}-chart`);
+            const finiteSeries = (plot?._fullData || [])
+              .filter(trace => [...(trace.y || [])]
+                .some(value => Number.isFinite(Number(value))))
+              .map(trace => trace.name);
+            const correlation = plot?._fullData.find(
+              trace => trace.name === 'Average correlation');
+            const values = (correlation?.y || []).map(Number).filter(Number.isFinite);
+            return {
+              window,
+              title: document.querySelector(
+                `#view-average-correlation-${window}-chart h2`)?.textContent || null,
+              series: finiteSeries,
+              points: values.length,
+              low: values.length ? Math.min(...values) : null,
+              high: values.length ? Math.max(...values) : null,
+              tickSuffix: plot?._fullLayout.yaxis.ticksuffix || null,
             };
           });
           const geometricTrace = geometric._fullData.find(
@@ -236,12 +279,14 @@ with sync_playwright() as playwright:
               .filter(trace => [...(trace.y || [])].some(value => Number.isFinite(Number(value))))
               .map(trace => trace.name),
             smaCharts,
+            dispersionCharts,
+            correlationCharts,
             health: document.querySelector('footer')?.textContent || '',
           };
         }
         """
     )
-    assert 1 <= initial["plots"] <= 14 and initial["kpis"] == 14, initial
+    assert 1 <= initial["plots"] <= 20 and initial["kpis"] == 20, initial
     assert initial["kpiLabels"] == [
         "VAS total return",
         "ASX 300 geometric",
@@ -255,6 +300,12 @@ with sync_playwright() as playwright:
         "% above 20SMA",
         "% above 50SMA",
         "% above 200SMA",
+        "21d dispersion",
+        "63d dispersion",
+        "120d dispersion",
+        "21d avg correlation",
+        "63d avg correlation",
+        "120d avg correlation",
         "AXVI",
         "XDA",
     ], initial
@@ -286,12 +337,22 @@ with sync_playwright() as playwright:
         label = f"% above {window}SMA"
         assert initial["kpiValues"][label].endswith("%"), initial
         assert "eligible above" in initial["kpiDetails"][label], initial
+    for window in (21, 63, 120):
+        label = f"{window}d dispersion"
+        assert initial["kpiValues"][label].endswith("%"), initial
+        detail = initial["kpiDetails"][label]
+        assert all(term in detail for term in ("Avg stock", "VAS", "names")), initial
+    for window in (21, 63, 120):
+        label = f"{window}d avg correlation"
+        assert initial["kpiValues"][label].endswith("%"), initial
+        detail = initial["kpiDetails"][label]
+        assert all(term in detail for term in ("stocks", "pairs")), initial
     assert initial["mastheads"] == 0 and initial["footers"] == 1, initial
     assert "holdings as at" in initial["footerText"], initial
     assert "Generated" in initial["footerText"], initial
-    assert initial["selectorCards"] == 14, initial
-    assert initial["sparklineCards"] == 14, initial
-    assert initial["sparklinePeriods"] == ["1Y"] * 14, initial
+    assert initial["selectorCards"] == 20, initial
+    assert initial["sparklineCards"] == 20, initial
+    assert initial["sparklinePeriods"] == ["1Y"] * 20, initial
     assert initial["sparklinePaths"] >= initial["plots"], initial
     assert initial["sparklineColours"]["ASX 300 geometric"] == ["rgb(22, 33, 29)"], (
         initial
@@ -311,7 +372,7 @@ with sync_playwright() as playwright:
         "rgb(17, 17, 17)",
         "rgb(184, 75, 69)",
     }, initial
-    assert initial["chartPanes"] == 1 and initial["chartViews"] == 14, initial
+    assert initial["chartPanes"] == 1 and initial["chartViews"] == 20, initial
     assert initial["activeViews"] == 1 and initial["pressedSelectors"] == 1, initial
     assert initial["maxSelectorHeight"] <= 130, initial
     assert initial["selectorColumns"] == 4, initial
@@ -389,6 +450,21 @@ with sync_playwright() as playwright:
         assert 0 <= chart["low"] <= chart["high"] <= 100, chart
         assert chart["tickSuffix"] == "%", chart
         assert chart["referenceLines"] == 1, chart
+    assert len(initial["dispersionCharts"]) == 3, initial
+    for chart in initial["dispersionCharts"]:
+        window = chart["window"]
+        assert chart["title"] == f"{window}-Day Realized Dispersion", chart
+        assert chart["series"] == ["Dispersion"], chart
+        assert chart["points"] > 0, chart
+        assert chart["tickSuffix"] == "%", chart
+    assert len(initial["correlationCharts"]) == 3, initial
+    for chart in initial["correlationCharts"]:
+        window = chart["window"]
+        assert chart["title"] == f"{window}-Day Average Stock Correlation", chart
+        assert chart["series"] == ["Average correlation"], chart
+        assert chart["points"] > 0, chart
+        assert -100 <= chart["low"] <= chart["high"] <= 100, chart
+        assert chart["tickSuffix"] == "%", chart
     assert "Cached through" in initial["health"], initial
     rasi_available = any(
         item["id"] == "plot-rasi-chart" for item in initial["defaultReadouts"]
