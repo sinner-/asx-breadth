@@ -524,6 +524,7 @@ def _sync_text(
     quoted = int(summary.get("quoted_latest", 0) or 0)
     with_history = int(summary.get("with_history", 0) or 0)
     failures = int(summary.get("provider_failures", 0) or 0)
+    provider_outage = bool(summary.get("provider_outage", False))
     latest = summary.get("latest_session")
     coverage = quoted / holdings if holdings else 0.0
     prefix = "No cached session"
@@ -534,11 +535,22 @@ def _sync_text(
             prefix = f"Cached through {session:%-d %b %Y}"
         except ValueError:
             prefix = f"Cached through {latest}"
-    result = f"{prefix} · {quoted}/{holdings} quoted ({coverage:.1%})"
+    if provider_outage:
+        result = "Yahoo sync unavailable"
+        result += (
+            f" · showing validated cache through {session:%-d %b %Y}"
+            if session is not None
+            else " · no validated cached session"
+        )
+    else:
+        result = prefix
+    result += f" · {quoted}/{holdings} quoted ({coverage:.1%})"
     if holdings and "with_history" in summary and with_history < holdings:
-        result += f" · history {with_history}/{holdings}"
-    if failures:
-        result += f" · {failures} sync error{'s' if failures != 1 else ''}"
+        result += f" · verified history {with_history}/{holdings}"
+    if failures and not provider_outage:
+        denominator = f"/{holdings}" if holdings else ""
+        noun = "holding" if failures == 1 else "holdings"
+        result += f" · sync failed for {failures}{denominator} {noun}"
     stale_count = (
         _business_days_since(session, today or date.today())
         if session is not None

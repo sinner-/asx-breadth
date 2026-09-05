@@ -229,6 +229,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             BUILT_IN_INDICATORS,
         )
         summary = database.sync_summary(snapshot.snapshot_id)
+        if sync_report is not None:
+            summary.update(
+                {
+                    "provider_outage": sync_report.provider_outage,
+                    "provider_outage_requests": sync_report.provider_outage_requests,
+                }
+            )
         render_dashboard(
             arguments.output,
             snapshot=snapshot,
@@ -238,13 +245,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
 
     if sync_report is not None:
-        logging.info(
-            "Sync: %d requests, %d succeeded, %d failed, %d factor changes",
-            sync_report.requested,
-            sync_report.successful,
-            sync_report.failed,
-            sync_report.factor_changes,
-        )
+        if sync_report.provider_outage:
+            individual_failures = max(
+                0, sync_report.failed - sync_report.provider_outage_requests
+            )
+            logging.warning(
+                "Sync degraded: Yahoo unavailable for %d/%d requests; "
+                "%d succeeded, %d individual failure(s), %d factor changes; "
+                "dashboard rebuilt from validated cached data",
+                sync_report.provider_outage_requests,
+                sync_report.requested,
+                sync_report.successful,
+                individual_failures,
+                sync_report.factor_changes,
+            )
+        else:
+            logging.info(
+                "Sync: %d requests, %d succeeded, %d failed, %d factor changes",
+                sync_report.requested,
+                sync_report.successful,
+                sync_report.failed,
+                sync_report.factor_changes,
+            )
     logging.info("Dashboard written to %s", arguments.output.expanduser().resolve())
     logging.info("SQLite cache: %s", arguments.db.expanduser().resolve())
     return 0

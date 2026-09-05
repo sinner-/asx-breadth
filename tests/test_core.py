@@ -4,7 +4,7 @@
 #   "openpyxl>=3.1.5,<4",
 #   "pandas>=2.2,<4",
 #   "plotly>=6.0,<7",
-#   "yfinance>=1.4,<2",
+#   "yfinance[repair]>=1.4,<2",
 # ]
 # ///
 """Focused regression tests; run with: uv run tests/test_core.py"""
@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from asx_breadth.db import Database  # noqa: E402
+from asx_breadth.dashboard import _sync_text  # noqa: E402
 from asx_breadth.holdings import parse_holdings  # noqa: E402
 from asx_breadth.indicators import (  # noqa: E402
     AdvanceDecline,
@@ -65,6 +66,44 @@ from asx_breadth.sync import synchronise  # noqa: E402
 
 
 class DashboardTests(unittest.TestCase):
+    def test_sync_health_counts_failed_holdings_not_error_events(self) -> None:
+        text = _sync_text(
+            {
+                "holdings": 315,
+                "quoted_latest": 297,
+                "with_history": 297,
+                "provider_failures": 315,
+                "latest_session": "2026-08-21",
+                "unavailable_symbols": ("AVZ", "AXQ"),
+            },
+            today=date(2026, 9, 4),
+        )
+
+        self.assertIn("297/315 quoted", text)
+        self.assertIn("verified history 297/315", text)
+        self.assertIn("sync failed for 315/315 holdings", text)
+        self.assertNotIn("315 sync errors", text)
+
+    def test_sync_health_reports_one_provider_outage_for_cached_fallback(self) -> None:
+        text = _sync_text(
+            {
+                "holdings": 315,
+                "quoted_latest": 297,
+                "with_history": 297,
+                "provider_failures": 315,
+                "provider_outage": True,
+                "latest_session": "2026-08-21",
+                "unavailable_symbols": ("AVZ", "AXQ"),
+            },
+            today=date(2026, 9, 4),
+        )
+
+        self.assertIn(
+            "Yahoo sync unavailable · showing validated cache through 21 Aug 2026",
+            text,
+        )
+        self.assertNotIn("sync failed for 315/315 holdings", text)
+
     def test_trend_state_names_each_ema(self) -> None:
         self.assertEqual(
             relative_state(108.92, 108.97, 108.68),

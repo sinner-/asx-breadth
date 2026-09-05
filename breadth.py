@@ -6,7 +6,7 @@
 #   "openpyxl>=3.1.5,<4",
 #   "pandas>=2.2,<4",
 #   "plotly>=6.0,<7",
-#   "yfinance>=1.4,<2",
+#   "yfinance[repair]>=1.4,<2",
 # ]
 # ///
 """ASX market-breadth command-line entrypoint."""

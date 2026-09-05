@@ -228,8 +228,9 @@ cross-run cooldowns, bounded probes for halted securities, and seam validation b
 response can advance state. A suspiciously short initial history needs a second matching
 probe—even when the requested lookback date moves between weekly runs—before it is accepted
 as a natural listing boundary. Anchor-invalid or internally incomplete overlap responses stay
-inside the configured retry/backoff loop. A failed provider run still rebuilds the dashboard
-from valid cached data.
+inside the configured retry/backoff loop. A broad all-symbol failure is recorded once as a
+provider outage and does not poison every instrument's retry cooldown. A failed provider run
+still rebuilds the dashboard from valid cached data and labels that fallback explicitly.
 
 ## Tests
 

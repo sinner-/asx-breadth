@@ -4,7 +4,7 @@
 #   "openpyxl>=3.1.5,<4",
 #   "pandas>=2.2,<4",
 #   "plotly>=6.0,<7",
-#   "yfinance>=1.4,<2",
+#   "yfinance[repair]>=1.4,<2",
 # ]
 # ///
 """White-box persistence and synchronisation regressions."""
@@ -35,10 +35,52 @@ from asx_breadth.models import (  # noqa: E402
     SyncTarget,
 )
 from asx_breadth.providers.yahoo import YahooProvider, _normalise  # noqa: E402
-from asx_breadth.sync import synchronise  # noqa: E402
+from asx_breadth.sync import SyncReport, synchronise  # noqa: E402
 
 
 class MigrationAndAdmissionTests(unittest.TestCase):
+    def test_cli_rebuilds_cached_dashboard_during_provider_outage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            report = SyncReport(
+                requested=12,
+                skipped_current=0,
+                skipped_backoff=0,
+                successful=0,
+                factor_changes=0,
+                failed=12,
+                completed_through=date(2026, 7, 18),
+                provider_outage=True,
+                provider_outage_requests=12,
+            )
+            holdings = _holdings(
+                date(2026, 7, 1),
+                "provider-outage",
+                tuple(f"T{index:02d}" for index in range(12)),
+            )
+            with (
+                patch.object(cli, "parse_holdings", return_value=holdings),
+                patch.object(cli, "synchronise", return_value=report),
+                patch.object(cli, "run_indicators", return_value={}),
+                patch.object(cli, "render_dashboard") as render_dashboard,
+            ):
+                exit_code = cli.main(
+                    [
+                        str(root / "holdings.xlsx"),
+                        "--db",
+                        str(root / "cache.sqlite3"),
+                        "--output",
+                        str(root / "dashboard.html"),
+                        "--universe-code",
+                        "TEST",
+                    ]
+                )
+
+            self.assertEqual(exit_code, 0)
+            summary = render_dashboard.call_args.kwargs["sync_summary"]
+            self.assertTrue(summary["provider_outage"])
+            self.assertEqual(summary["provider_outage_requests"], 12)
+
     def test_repairs_v2_cache_and_splits_legacy_sync_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "cache.sqlite3"
@@ -418,6 +460,175 @@ class FactorAndProviderTests(unittest.TestCase):
 
 
 class ObligationTests(unittest.TestCase):
+    def test_provider_outage_does_not_poison_each_symbol_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "cache.sqlite3")
+            try:
+                snapshot = database.import_snapshot(
+                    _holdings(
+                        date(2026, 7, 1),
+                        "broad-outage",
+                        tuple(f"T{index:02d}" for index in range(12)),
+                    ),
+                    universe_code="TEST",
+                    universe_name="TEST",
+                )
+                targets = tuple(
+                    SyncTarget(instrument, active=True)
+                    for instrument in snapshot.instruments
+                )
+                seed_run = database.start_fetch_run(date(2026, 7, 9), date(2026, 7, 11))
+                seed = _frame(["2026-07-09", "2026-07-10"], [99.0, 100.0])
+                for instrument in snapshot.instruments:
+                    database.append_series(
+                        run_id=seed_run,
+                        instrument_id=instrument.instrument_id,
+                        frame=seed,
+                    )
+                    database.update_sync_success(
+                        instrument_id=instrument.instrument_id,
+                        checked_through=date(2026, 7, 11),
+                        latest_trade_date=date(2026, 7, 10),
+                        backfill_attempted=True,
+                    )
+                    database.mark_history_checked(
+                        instrument.instrument_id, date(2026, 5, 1)
+                    )
+
+                report = synchronise(
+                    database,
+                    targets,
+                    SyncOptions(
+                        lookback_sessions=10,
+                        batch_size=20,
+                        retries=1,
+                        batch_pause=0,
+                        base_backoff=0,
+                    ),
+                    now=datetime(2026, 7, 17, 8, tzinfo=UTC),
+                    provider=_UnavailableProvider(),
+                )
+
+                self.assertTrue(report.provider_outage)
+                self.assertEqual(report.provider_outage_requests, 12)
+                self.assertEqual(report.failed, 12)
+                states = database.obligation_states(
+                    [instrument.instrument_id for instrument in snapshot.instruments]
+                )
+                self.assertEqual(len(states), 12)
+                self.assertTrue(
+                    all(
+                        state["checked_through"] == "2026-07-11"
+                        for state in states.values()
+                    )
+                )
+                self.assertTrue(
+                    all(state["consecutive_failures"] == 0 for state in states.values())
+                )
+                self.assertTrue(
+                    all(state["retry_after"] is None for state in states.values())
+                )
+                self.assertTrue(
+                    all(state["last_error"] is None for state in states.values())
+                )
+                factor_count = database.connection.execute(
+                    "SELECT COUNT(*) FROM daily_factors"
+                ).fetchone()[0]
+                self.assertEqual(factor_count, 24)
+
+                explicit_empty = synchronise(
+                    database,
+                    targets,
+                    _options(),
+                    now=datetime(2026, 7, 17, 8, tzinfo=UTC),
+                    provider=_EmptyProvider(),
+                )
+                self.assertTrue(explicit_empty.provider_outage)
+                states = database.obligation_states(
+                    [instrument.instrument_id for instrument in snapshot.instruments]
+                )
+                self.assertTrue(
+                    all(state["consecutive_failures"] == 0 for state in states.values())
+                )
+                self.assertTrue(
+                    all(state["retry_after"] is None for state in states.values())
+                )
+
+                recovery = synchronise(
+                    database,
+                    targets,
+                    _options(),
+                    now=datetime(2026, 7, 17, 8, tzinfo=UTC),
+                    provider=_Provider(
+                        [
+                            _frame(
+                                [
+                                    "2026-07-09",
+                                    "2026-07-10",
+                                    "2026-07-13",
+                                    "2026-07-14",
+                                    "2026-07-15",
+                                    "2026-07-16",
+                                    "2026-07-17",
+                                ],
+                                [99.0, 100.0, 101.0, 102.0, 103.0, 104.0, 105.0],
+                            )
+                        ]
+                    ),
+                )
+                self.assertEqual(recovery.requested, 12)
+                self.assertEqual(recovery.skipped_backoff, 0)
+                self.assertFalse(recovery.provider_outage)
+            finally:
+                database.close()
+
+    def test_partial_failure_keeps_only_the_missing_symbol_in_backoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            database = Database(Path(directory) / "cache.sqlite3")
+            try:
+                snapshot = database.import_snapshot(
+                    _holdings(
+                        date(2026, 7, 1),
+                        "partial-outage",
+                        tuple(f"T{index:02d}" for index in range(12)),
+                    ),
+                    universe_code="TEST",
+                    universe_name="TEST",
+                )
+                targets = tuple(
+                    SyncTarget(instrument, active=True)
+                    for instrument in snapshot.instruments
+                )
+                report = synchronise(
+                    database,
+                    targets,
+                    SyncOptions(
+                        lookback_sessions=10,
+                        batch_size=20,
+                        retries=1,
+                        batch_pause=0,
+                        base_backoff=0,
+                    ),
+                    now=datetime(2026, 7, 17, 8, tzinfo=UTC),
+                    provider=_PartialProvider(
+                        _frame(["2026-07-16", "2026-07-17"], [100.0, 101.0])
+                    ),
+                )
+
+                self.assertFalse(report.provider_outage)
+                self.assertEqual(report.failed, 1)
+                states = database.obligation_states(
+                    [instrument.instrument_id for instrument in snapshot.instruments]
+                )
+                failed_ids = {
+                    instrument_id
+                    for (instrument_id, _), state in states.items()
+                    if state["last_error"] is not None
+                }
+                self.assertEqual(len(failed_ids), 1)
+            finally:
+                database.close()
+
     def test_history_failure_survives_forward_success(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             database, instrument_id = _database_with_instrument(Path(directory))
@@ -675,6 +886,24 @@ class _Provider:
         frame = self.frames[min(self.calls, len(self.frames) - 1)]
         self.calls += 1
         return {symbol: frame.copy() for symbol in symbols}
+
+
+class _UnavailableProvider:
+    def fetch(self, symbols: list[str], **_: object) -> dict[str, pd.DataFrame]:
+        return {}
+
+
+class _EmptyProvider:
+    def fetch(self, symbols: list[str], **_: object) -> dict[str, pd.DataFrame]:
+        return {symbol: pd.DataFrame() for symbol in symbols}
+
+
+class _PartialProvider:
+    def __init__(self, frame: pd.DataFrame):
+        self.frame = frame
+
+    def fetch(self, symbols: list[str], **_: object) -> dict[str, pd.DataFrame]:
+        return {symbol: self.frame.copy() for symbol in symbols[:-1]}
 
 
 def _options() -> SyncOptions:

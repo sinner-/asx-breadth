@@ -8,7 +8,7 @@ import math
 import random
 import sqlite3
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, time as wall_time, timedelta
 from itertools import islice
@@ -23,6 +23,7 @@ from .providers.yahoo import YahooProvider
 
 
 SYDNEY = ZoneInfo("Australia/Sydney")
+MIN_PROVIDER_OUTAGE_SYMBOLS = 10
 
 
 @dataclass(frozen=True, slots=True)
@@ -34,6 +35,8 @@ class SyncReport:
     factor_changes: int
     failed: int
     completed_through: date
+    provider_outage: bool = False
+    provider_outage_requests: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -80,12 +83,16 @@ class _ExecutionResult:
     successful: int = 0
     factor_changes: int = 0
     failed: int = 0
+    provider_outage_requests: int = 0
 
     def __add__(self, other: _ExecutionResult) -> _ExecutionResult:
         return _ExecutionResult(
             successful=self.successful + other.successful,
             factor_changes=self.factor_changes + other.factor_changes,
             failed=self.failed + other.failed,
+            provider_outage_requests=(
+                self.provider_outage_requests + other.provider_outage_requests
+            ),
         )
 
 
@@ -137,14 +144,19 @@ class _FetchState:
             symbol for symbol in self.pending if symbol not in self.successes
         ]
 
-    def finalise(self) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+    def finalise(
+        self,
+    ) -> tuple[dict[str, pd.DataFrame], dict[str, str], frozenset[str]]:
+        ambiguous = frozenset(
+            symbol for symbol in self.pending if symbol not in self.explicit_empty
+        )
         for symbol in self.pending:
             self.errors.setdefault(
                 symbol, "Yahoo returned no usable daily rows after all retries"
             )
             if symbol in self.explicit_empty:
                 self.successes[symbol] = pd.DataFrame()
-        return self.successes, self.errors
+        return self.successes, self.errors, ambiguous
 
 
 def completed_session_end(now: datetime | None = None) -> date:
@@ -182,14 +194,23 @@ def synchronise(
         options=options,
         now_utc=now_utc,
     )
+    requested = sum(len(requests) for requests in plan.groups.values())
+    outage_threshold = max(
+        MIN_PROVIDER_OUTAGE_SYMBOLS,
+        math.ceil(requested * 0.80),
+    )
     return SyncReport(
-        requested=sum(len(requests) for requests in plan.groups.values()),
+        requested=requested,
         skipped_current=plan.skipped_current,
         skipped_backoff=plan.skipped_backoff,
         successful=result.successful,
         factor_changes=result.factor_changes,
         failed=result.failed,
         completed_through=run_end,
+        provider_outage=(
+            requested > 0 and result.provider_outage_requests >= outage_threshold
+        ),
+        provider_outage_requests=result.provider_outage_requests,
     )
 
 
@@ -399,13 +420,22 @@ def _execute_request_group(
     if len(by_symbol) != len(requests):
         raise ValueError("A fetch group contains duplicate provider symbols")
     run_id = database.start_fetch_run(start, end)
-    frames, errors = _fetch_with_retries(
+    frames, errors, ambiguous = _fetch_with_retries(
         provider,
         requests=by_symbol,
         start=start,
         end=end,
         options=options,
     )
+    if _is_provider_outage(requests, frames=frames, ambiguous=ambiguous):
+        dominant_error = _dominant_error(errors, frozenset(by_symbol))
+        message = f"Provider-wide failure for {len(requests)} symbols: {dominant_error}"
+        logging.warning("%s; preserving per-symbol retry state", message)
+        database.finish_fetch_run(run_id, "failed", message)
+        return _ExecutionResult(
+            failed=len(requests),
+            provider_outage_requests=len(requests),
+        )
     result = _ExecutionResult()
     try:
         for symbol, request in by_symbol.items():
@@ -821,7 +851,7 @@ def _fetch_with_retries(
     start: date,
     end: date,
     options: SyncOptions,
-) -> tuple[dict[str, pd.DataFrame], dict[str, str]]:
+) -> tuple[dict[str, pd.DataFrame], dict[str, str], frozenset[str]]:
     context = _FetchContext(provider, requests, start, end, options)
     state = _FetchState.for_requests(requests)
     for attempt in range(1, options.retries + 1):
@@ -840,6 +870,37 @@ def _fetch_with_retries(
             break
         _backoff_before_retry(state, options, attempt)
     return state.finalise()
+
+
+def _is_provider_outage(
+    requests: list[_Request],
+    *,
+    frames: dict[str, pd.DataFrame],
+    ambiguous: frozenset[str],
+) -> bool:
+    """Recognise a broad unusable response without blaming every instrument.
+
+    A wholly empty Yahoo batch is deliberately ambiguous: it can mean a
+    transport, authentication, dependency, or upstream service failure. Once
+    that happens across a sizeable request group, applying hundreds of symbol
+    cooldowns destroys the cache's graceful-degradation behaviour. Empty
+    frames remain ordinary symbol results when the same group also contains
+    usable responses; an all-empty group is a provider-level failure.
+    """
+    unusable = set(ambiguous)
+    unusable.update(symbol for symbol, frame in frames.items() if frame.empty)
+    return (
+        len(requests) >= MIN_PROVIDER_OUTAGE_SYMBOLS
+        and len(unusable) == len(requests)
+        and not any(not frame.empty for frame in frames.values())
+    )
+
+
+def _dominant_error(errors: dict[str, str], symbols: frozenset[str]) -> str:
+    messages = [errors[symbol] for symbol in symbols if symbol in errors]
+    if not messages:
+        return "Yahoo returned no usable responses after all retries"
+    return Counter(messages).most_common(1)[0][0]
 
 
 def _fetch_batch(
