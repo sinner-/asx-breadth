@@ -123,6 +123,29 @@ available composition is used as an acknowledged approximation so the downloaded
 can still produce long-run breadth indicators. Later workbook dates remain point-in-time
 transitions.
 
+Workbook rows are preserved separately from the breadth composition. A five-character
+ASX code ending in `XX` is treated as an additional settlement line when the same
+snapshot contains its three-character ordinary code with the same issuer name. For
+example, ASX documents [LOTXX converting into LOT](https://asxonline.com/content/asxonline/public/notices/2026/february/0154.26.02.html).
+The ordinary holding counts once; the paired settlement line is excluded from Yahoo
+requests and breadth denominators, including historical compositions. Other suffixes
+(such as `SGLLV`), unmatched issuers, and unpaired `XX` rows remain separate;
+the program does not guess a replacement price series.
+
+Verified temporary trading codes resolve to the ordinary instrument for breadth and
+downloads. `PDIDB` in the 26 August–6 September 2026 consolidation period uses `PDI.AX`'s
+split-adjusted history, retaining the existing PDI factor chain. The raw workbook entry
+is preserved. The mapping requires the documented issuer and effective dates, and its
+source is recorded in `instrument_aliases`. Obsolete cache records for the temporary
+instrument are backed up and removed by the same cleanup as duplicate settlement lines.
+
+On startup, obsolete price records, factors, probe evidence, and sync obligations for
+instruments classified solely as paired settlement lines are removed from the cache.
+A timestamped SQLite backup is made alongside the cache before any deletion. Source
+workbook rows and fetch-run audit records remain intact. Instruments eligible in another
+snapshot or used as a market series are protected from this cleanup. Terminal logs show request
+totals, symbols, retries, Yahoo errors, and indicator calculation stages.
+
 Workbook schema validation fails closed before database import when the required holdings
 headers are missing or ambiguous. Column order, unrelated extra columns, a holdings table on
 a non-active worksheet, and blank optional row details remain supported.

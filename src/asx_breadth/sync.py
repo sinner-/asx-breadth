@@ -389,7 +389,28 @@ def _execute_sync_plan(
     now_utc: datetime,
 ) -> _ExecutionResult:
     result = _ExecutionResult()
-    for start, request_end in sorted(plan.groups):
+    total = sum(len(requests) for requests in plan.groups.values())
+    completed = 0
+    logging.info(
+        "Sync plan: %d requests across %d date ranges; %d targets skipped, "
+        "%d obligations cooling down",
+        total,
+        len(plan.groups),
+        plan.skipped_current,
+        plan.skipped_backoff,
+    )
+    # Refresh recent prices before spending time on old history/removal probes.
+    ordered_groups = sorted(
+        plan.groups, key=lambda dates: (dates[1], dates[0]), reverse=True
+    )
+    for group_number, (start, request_end) in enumerate(ordered_groups, 1):
+        logging.info(
+            "Date range %d/%d; %d/%d requests processed",
+            group_number,
+            len(plan.groups),
+            completed,
+            total,
+        )
         result += _execute_request_group(
             database,
             provider,
@@ -400,6 +421,14 @@ def _execute_sync_plan(
             end=request_end,
             options=options,
             now_utc=now_utc,
+        )
+        completed += len(plan.groups[(start, request_end)])
+        logging.info(
+            "Sync progress: %d/%d processed; %d succeeded, %d failed",
+            completed,
+            total,
+            result.successful,
+            result.failed,
         )
     return result
 
@@ -912,13 +941,14 @@ def _fetch_batch(
     batch_number: int,
 ) -> None:
     logging.info(
-        "Yahoo %s to %s: attempt %d/%d, batch %d, %d symbol(s)",
+        "Yahoo %s to %s: attempt %d/%d, batch %d, %d symbol(s): %s",
         context.start,
         context.end,
         attempt,
         context.options.retries,
         batch_number,
         len(batch),
+        ", ".join(batch),
     )
     try:
         returned = context.provider.fetch(
@@ -948,8 +978,9 @@ def _backoff_before_retry(
     if delay > 0:
         delay += random.uniform(0, delay * 0.2)
     logging.warning(
-        "%d symbol(s) still missing; backing off %.1fs before retry %d/%d",
+        "%d symbol(s) still missing (%s); backing off %.1fs before retry %d/%d",
         len(state.pending),
+        ", ".join(state.pending),
         delay,
         attempt + 1,
         options.retries,

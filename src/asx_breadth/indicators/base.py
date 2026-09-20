@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any, Mapping, Protocol, Sequence
 
@@ -83,5 +85,13 @@ def run_indicators(
             raise ValueError(f"Cyclic indicator dependencies: {details}")
         for key in ready:
             indicator = pending.pop(key)
+            logging.info(
+                "Calculating indicator %d/%d: %s",
+                len(results) + 1,
+                len(registered),
+                key,
+            )
+            started = time.monotonic()
             results[key] = indicator.calculate(context, results)
+            logging.info("Finished %s in %.1fs", key, time.monotonic() - started)
     return results

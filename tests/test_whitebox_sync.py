@@ -15,6 +15,8 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from contextlib import closing
+from dataclasses import replace
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import patch
@@ -39,6 +41,342 @@ from asx_breadth.sync import SyncReport, synchronise  # noqa: E402
 
 
 class MigrationAndAdmissionTests(unittest.TestCase):
+    def test_temporary_code_keeps_continuous_membership_and_reuses_price_cache(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            Database(Path(directory) / "cache.sqlite3") as database,
+        ):
+
+            def holdings(day: date, symbol: str) -> HoldingsFile:
+                source = _holdings(day, str(day), (symbol,))
+                return replace(
+                    source,
+                    holdings=(
+                        replace(source.holdings[0], name="Predictive Discovery Ltd"),
+                    ),
+                )
+
+            first = database.import_snapshot(
+                holdings(date(2026, 7, 31), "PDI"),
+                universe_code="TEST",
+                universe_name="TEST",
+            )
+            pdi = first.instruments[0].instrument_id
+            run = database.start_fetch_run(date(2026, 8, 1), date(2026, 9, 21))
+            database.append_series(
+                run_id=run,
+                instrument_id=pdi,
+                frame=_frame(
+                    ["2026-08-25", "2026-08-26", "2026-09-04"], [4.475, 4.61, 4.67]
+                ),
+            )
+            expected_factors = database.factors_for_instrument(pdi)
+            second = database.import_snapshot(
+                holdings(date(2026, 8, 31), "PDIDB"),
+                universe_code="TEST",
+                universe_name="TEST",
+            )
+            self.assertEqual(second.instruments[0].instrument_id, pdi)
+            self.assertEqual(
+                set(database.membership_for_snapshot(second.snapshot_id).instrument_id),
+                {pdi},
+            )
+            self.assertEqual(
+                [
+                    t.instrument.provider_symbol
+                    for t in database.sync_targets_for_snapshot(second.snapshot_id)
+                ],
+                ["PDI.AX"],
+            )
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM sync_requirements"
+                ).fetchone()[0],
+                0,
+            )
+            source_id = database.connection.execute(
+                "SELECT id FROM instruments WHERE local_symbol='PDIDB'"
+            ).fetchone()[0]
+            database.append_series(
+                run_id=run,
+                instrument_id=source_id,
+                frame=_frame(["2026-09-04"], [4.67]),
+            )
+            database.connection.execute(
+                """INSERT INTO sync_requirements
+                (universe_id, instrument_id, snapshot_id, required_end, status, created_at)
+                SELECT universe_id, ?, id, '2026-08-31', 'pending', '2026-09-20'
+                FROM universe_snapshots WHERE id = ?""",
+                (pdi, second.snapshot_id),
+            )
+            database.connection.commit()
+            removed = database.cleanup_settlement_cache()
+            self.assertEqual(removed["daily_factors"], 1)
+            self.assertEqual(removed["sync_requirements"], 1)
+            pd.testing.assert_frame_equal(
+                database.factors_for_instrument(pdi), expected_factors
+            )
+            self.assertEqual(database.sync_summary(second.snapshot_id)["holdings"], 1)
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT instrument_id FROM snapshot_holdings WHERE snapshot_id=?",
+                    (second.snapshot_id,),
+                ).fetchone()[0],
+                source_id,
+            )
+
+    def test_temporary_code_resolves_on_first_import_but_not_outside_event(
+        self,
+    ) -> None:
+        for day, name, expected in (
+            (date(2026, 8, 31), "Predictive Discovery Ltd", "PDI.AX"),
+            (date(2026, 8, 25), "Predictive Discovery Ltd", "PDIDB.AX"),
+            (date(2026, 9, 7), "Predictive Discovery Ltd", "PDIDB.AX"),
+            (date(2026, 8, 31), "Different Issuer", "PDIDB.AX"),
+        ):
+            with (
+                self.subTest(day=day, name=name),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                with Database(Path(directory) / "cache.sqlite3") as database:
+                    source = _holdings(day, "first", ("PDIDB",))
+                    source = replace(
+                        source, holdings=(replace(source.holdings[0], name=name),)
+                    )
+                    snapshot = database.import_snapshot(
+                        source, universe_code="TEST", universe_name="TEST"
+                    )
+                    self.assertEqual(snapshot.instruments[0].provider_symbol, expected)
+
+    def test_v4_cache_resolves_temporary_code_and_deduplicates_same_snapshot(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.sqlite3"
+            with Database(path) as database:
+                source = _holdings(date(2026, 8, 31), "both", ("PDI", "PDIDB"))
+                source = replace(
+                    source,
+                    holdings=tuple(
+                        replace(h, name="Predictive Discovery Ltd")
+                        for h in source.holdings
+                    ),
+                )
+                snapshot = database.import_snapshot(
+                    source, universe_code="TEST", universe_name="TEST"
+                )
+                database.connection.executescript(
+                    "DROP VIEW breadth_holdings; "
+                    "CREATE VIEW breadth_holdings AS SELECT * FROM snapshot_holdings; "
+                    "PRAGMA user_version = 4;"
+                )
+            with Database(path) as database:
+                self.assertEqual(
+                    [
+                        i.provider_symbol
+                        for i in database.snapshot(snapshot.snapshot_id).instruments
+                    ],
+                    ["PDI.AX"],
+                )
+                self.assertEqual(
+                    len(database.membership_for_snapshot(snapshot.snapshot_id)), 1
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT COUNT(*) FROM snapshot_holdings"
+                    ).fetchone()[0],
+                    2,
+                )
+
+    def test_settlement_cleanup_preserves_sources_and_ordinary_prices(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "cache.sqlite3"
+            with Database(path) as database:
+                source = _holdings(date(2026, 7, 1), "paired", ("AAA", "AAAXX"))
+                source = replace(
+                    source,
+                    holdings=tuple(
+                        replace(holding, name="Same Issuer")
+                        for holding in source.holdings
+                    ),
+                )
+                snapshot = database.import_snapshot(
+                    source, universe_code="TEST", universe_name="TEST"
+                )
+                ids = {
+                    row["local_symbol"]: row["id"]
+                    for row in database.connection.execute(
+                        "SELECT id, local_symbol FROM instruments"
+                    )
+                }
+                # Simulate v3's mistaken fetches and removal obligation.
+                run = database.start_fetch_run(date(2026, 6, 1), date(2026, 7, 18))
+                for instrument_id in ids.values():
+                    database.append_series(
+                        run_id=run,
+                        instrument_id=instrument_id,
+                        frame=_frame(["2026-07-01", "2026-07-02"], [10.0, 11.0]),
+                    )
+                    database.update_sync_success(
+                        instrument_id=instrument_id,
+                        checked_through=date(2026, 7, 18),
+                        latest_trade_date=date(2026, 7, 2),
+                        backfill_attempted=True,
+                    )
+                    database.mark_history_checked(instrument_id, date(2026, 6, 1))
+                database.connection.execute(
+                    """INSERT INTO sync_requirements
+                    (universe_id, instrument_id, snapshot_id, required_end, status, created_at)
+                    SELECT universe_id, ?, id, '2026-07-31', 'pending', '2026-08-01'
+                    FROM universe_snapshots WHERE id = ?""",
+                    (ids["AAAXX"], snapshot.snapshot_id),
+                )
+                database.connection.commit()
+                before = database.connection.execute(
+                    "SELECT * FROM snapshot_holdings"
+                ).fetchall()
+                ordinary = database.factors_for_instrument(ids["AAA"])
+                database.connection.executescript(
+                    "DROP VIEW breadth_holdings; DROP VIEW settlement_holdings; PRAGMA user_version = 3;"
+                )
+            with Database(path) as database:
+                self.assertEqual(
+                    database.settlement_lines_for_snapshot(snapshot.snapshot_id),
+                    ("AAAXX → AAA",),
+                )
+                self.assertEqual(
+                    [
+                        i.local_symbol
+                        for i in database.snapshot(snapshot.snapshot_id).instruments
+                    ],
+                    ["AAA"],
+                )
+                self.assertEqual(
+                    set(
+                        database.membership_for_snapshot(
+                            snapshot.snapshot_id
+                        ).instrument_id
+                    ),
+                    {ids["AAA"]},
+                )
+                self.assertEqual(
+                    [
+                        t.instrument.local_symbol
+                        for t in database.sync_targets_for_snapshot(
+                            snapshot.snapshot_id
+                        )
+                    ],
+                    ["AAA"],
+                )
+                counts = database.cleanup_settlement_cache()
+                self.assertEqual(counts["daily_factors"], 2)
+                self.assertEqual(counts["provider_observations"], 2)
+                self.assertEqual(counts["sync_requirements"], 1)
+                self.assertTrue(database.factors_for_instrument(ids["AAAXX"]).empty)
+                pd.testing.assert_frame_equal(
+                    database.factors_for_instrument(ids["AAA"]), ordinary
+                )
+                self.assertEqual(
+                    database.connection.execute(
+                        "SELECT * FROM snapshot_holdings"
+                    ).fetchall(),
+                    before,
+                )
+                self.assertEqual(
+                    database.sync_summary(snapshot.snapshot_id)["holdings"], 1
+                )
+                self.assertEqual(database.cleanup_settlement_cache(), {})
+                self.assertEqual(
+                    database.connection.execute("PRAGMA foreign_key_check").fetchall(),
+                    [],
+                )
+            backups = list(path.parent.glob("*.before-settlement-cleanup-*.sqlite3"))
+            self.assertEqual(len(backups), 1)
+            with closing(sqlite3.connect(backups[0])) as backup:
+                self.assertEqual(
+                    backup.execute("SELECT COUNT(*) FROM daily_factors").fetchone()[0],
+                    4,
+                )
+
+    def test_settlement_classification_is_scoped_to_same_snapshot_and_issuer(
+        self,
+    ) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            Database(Path(directory) / "cache.sqlite3") as database,
+        ):
+            first = _holdings(
+                date(2026, 7, 1), "unpaired", ("AAAXX", "SGLLV", "PDIDB", "XXX")
+            )
+            first = replace(
+                first, holdings=tuple(replace(h, name="Issuer") for h in first.holdings)
+            )
+            previous = database.import_snapshot(
+                first, universe_code="TEST", universe_name="TEST"
+            )
+            second = _holdings(
+                date(2026, 7, 31), "paired", ("AAA", "AAAXX", "BBB", "BBBXX")
+            )
+            second = replace(
+                second,
+                holdings=tuple(
+                    replace(
+                        h,
+                        name="Issuer"
+                        if h.local_symbol.startswith("AAA")
+                        else h.local_symbol,
+                    )
+                    for h in second.holdings
+                ),
+            )
+            current = database.import_snapshot(
+                second, universe_code="TEST", universe_name="TEST"
+            )
+            self.assertEqual(
+                database.settlement_lines_for_snapshot(previous.snapshot_id), ()
+            )
+            self.assertEqual(
+                database.settlement_lines_for_snapshot(current.snapshot_id),
+                ("AAAXX → AAA",),
+            )
+            self.assertEqual(
+                {i.local_symbol for i in current.instruments}, {"AAA", "BBB", "BBBXX"}
+            )
+            old_id = previous.instruments[0].instrument_id
+            database.mark_history_checked(old_id, date(2026, 1, 1))
+            self.assertEqual(database.cleanup_settlement_cache(), {})
+            self.assertIn(old_id, database.history_watermarks([old_id]))
+            self.assertEqual(
+                len(database.snapshot(previous.snapshot_id).instruments), 4
+            )
+
+    def test_paired_settlement_removal_does_not_create_sync_obligation(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as directory,
+            Database(Path(directory) / "cache.sqlite3") as database,
+        ):
+            source = _holdings(date(2026, 7, 1), "first", ("AAA", "AAAXX"))
+            source = replace(
+                source,
+                holdings=tuple(replace(h, name="Issuer") for h in source.holdings),
+            )
+            database.import_snapshot(source, universe_code="TEST", universe_name="TEST")
+            second = replace(
+                source,
+                as_of_date=date(2026, 7, 31),
+                sha256="second",
+                holdings=source.holdings[:1],
+            )
+            database.import_snapshot(second, universe_code="TEST", universe_name="TEST")
+            self.assertEqual(
+                database.connection.execute(
+                    "SELECT COUNT(*) FROM sync_requirements"
+                ).fetchone()[0],
+                0,
+            )
+
     def test_cli_rebuilds_cached_dashboard_during_provider_outage(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

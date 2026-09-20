@@ -431,7 +431,7 @@ class FactorCacheTests(unittest.TestCase):
             database = Database(path)
             self.assertEqual(
                 database.connection.execute("PRAGMA user_version").fetchone()[0],
-                3,
+                5,
             )
             database.close()
             connection = sqlite3.connect(path)

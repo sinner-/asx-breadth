@@ -120,7 +120,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         datefmt="%H:%M:%S",
     )
     if not arguments.verbose:
-        logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+        logging.getLogger("yfinance").setLevel(logging.ERROR)
 
     try:
         holdings_file = parse_holdings(
@@ -193,6 +193,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             # Hard temporal/source-identity invariants remain non-bypassable.
             logging.error("Cannot import holdings: %s", exc)
             return 2
+        database.cleanup_settlement_cache()
+        logging.info("Breadth: %d constituents", len(snapshot.instruments))
         membership = database.membership_for_snapshot(snapshot.snapshot_id)
         if not arguments.no_download:
             options = SyncOptions(
@@ -207,6 +209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             sync_targets = database.sync_targets_for_snapshot(snapshot.snapshot_id)
             sync_report = synchronise(database, sync_targets, options)
 
+        logging.info("Loading cached prices for indicator calculations")
         factors = database.factors_for_membership(membership)
         series_factors = {
             series.role: database.factors_for_instrument(
@@ -236,6 +239,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     "provider_outage_requests": sync_report.provider_outage_requests,
                 }
             )
+        logging.info("Writing dashboard to %s", arguments.output)
         render_dashboard(
             arguments.output,
             snapshot=snapshot,

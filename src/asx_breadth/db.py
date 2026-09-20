@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import logging
 import math
 import sqlite3
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from difflib import SequenceMatcher
@@ -24,7 +25,7 @@ from .models import (
 )
 
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 SYDNEY = ZoneInfo("Australia/Sydney")
 
 
@@ -111,6 +112,66 @@ CREATE TABLE IF NOT EXISTS snapshot_holdings (
     market_value REAL,
     units REAL,
     PRIMARY KEY (snapshot_id, instrument_id)
+);
+
+-- Keep workbook rows as source evidence. A paired ASX XXX/XXXXX holding
+-- whose suffix is XX is a settlement line, not another breadth constituent.
+-- Require the ordinary line and matching issuer in the SAME snapshot: never
+-- invent a parent, strip arbitrary suffixes, or apply future holdings evidence.
+-- ASX example: https://asxonline.com/content/asxonline/public/notices/2026/february/0154.26.02.html
+CREATE VIEW IF NOT EXISTS settlement_holdings AS
+SELECT h.snapshot_id, h.instrument_id, parent.id AS underlying_instrument_id
+FROM snapshot_holdings h
+JOIN instruments i ON i.id = h.instrument_id
+JOIN snapshot_holdings ordinary ON ordinary.snapshot_id = h.snapshot_id
+JOIN instruments parent ON parent.id = ordinary.instrument_id
+WHERE length(i.local_symbol) = 5 AND substr(i.local_symbol, 4) = 'XX'
+  AND i.exchange = 'ASX' AND i.provider = 'yahoo'
+  AND COALESCE(i.country_code, 'AU') IN ('', 'AU')
+  AND i.provider_symbol = i.local_symbol || '.AX'
+  AND parent.local_symbol = substr(i.local_symbol, 1, 3)
+  AND parent.exchange = 'ASX' AND parent.provider = 'yahoo'
+  AND COALESCE(parent.country_code, 'AU') IN ('', 'AU')
+  AND parent.provider_symbol = parent.local_symbol || '.AX'
+  AND lower(trim(parent.name)) = lower(trim(i.name));
+
+-- Verified temporary trading codes. These resolve membership to an existing
+-- ordinary price series; raw workbook rows and share counts are not rewritten.
+CREATE TABLE IF NOT EXISTS instrument_aliases (
+    provider_symbol TEXT PRIMARY KEY,
+    issuer_name TEXT NOT NULL,
+    canonical_symbol TEXT NOT NULL,
+    valid_from TEXT NOT NULL,
+    valid_until TEXT NOT NULL,
+    source_url TEXT NOT NULL
+);
+INSERT OR IGNORE INTO instrument_aliases VALUES (
+    'PDIDB.AX', 'Predictive Discovery Ltd', 'PDI.AX',
+    '2026-08-26', '2026-09-07',
+    'https://prod-ss.aap.com.au/aapreleases/globenewswire9814776/'
+);
+
+CREATE VIEW IF NOT EXISTS resolved_holdings AS
+SELECT h.snapshot_id, h.instrument_id AS source_instrument_id,
+       COALESCE(parent.id, h.instrument_id) AS instrument_id
+FROM snapshot_holdings h
+JOIN universe_snapshots s ON s.id = h.snapshot_id
+JOIN instruments i ON i.id = h.instrument_id
+LEFT JOIN instrument_aliases a
+  ON a.provider_symbol = i.provider_symbol
+ AND lower(trim(a.issuer_name)) = lower(trim(i.name))
+ AND i.exchange = 'ASX' AND i.provider = 'yahoo'
+ AND COALESCE(i.country_code, 'AU') IN ('', 'AU')
+ AND s.as_of_date >= a.valid_from AND s.as_of_date < a.valid_until
+LEFT JOIN instruments parent
+  ON parent.provider = 'yahoo' AND parent.provider_symbol = a.canonical_symbol;
+
+CREATE VIEW IF NOT EXISTS breadth_holdings AS
+SELECT DISTINCT h.snapshot_id, h.instrument_id FROM resolved_holdings h
+WHERE NOT EXISTS (
+    SELECT 1 FROM settlement_holdings excluded
+    WHERE excluded.snapshot_id = h.snapshot_id
+      AND excluded.instrument_id = h.source_instrument_id
 );
 
 CREATE TABLE IF NOT EXISTS universe_series (
@@ -311,6 +372,22 @@ class Database:
             raise
 
     def _migrate(self) -> None:
+        view_sql = self.connection.execute(
+            "SELECT sql FROM sqlite_master WHERE name = 'breadth_holdings'"
+        ).fetchone()[0]
+        if "resolved_holdings" not in view_sql:
+            self.connection.execute("DROP VIEW breadth_holdings")
+            self.connection.execute(
+                """CREATE VIEW breadth_holdings AS
+                SELECT DISTINCT h.snapshot_id, h.instrument_id
+                FROM resolved_holdings h
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM settlement_holdings excluded
+                    WHERE excluded.snapshot_id = h.snapshot_id
+                      AND excluded.instrument_id = h.source_instrument_id
+                )"""
+            )
+        self._ensure_canonical_instruments()
         columns = {
             row["name"]
             for row in self.connection.execute(
@@ -381,6 +458,25 @@ class Database:
                 """
             )
             self.connection.execute("DROP TABLE sync_state")
+
+    def _ensure_canonical_instruments(self) -> None:
+        self.connection.execute(
+            """
+            INSERT OR IGNORE INTO instruments
+                (exchange, local_symbol, provider, provider_symbol, name,
+                 sector, country_code)
+            SELECT i.exchange, substr(a.canonical_symbol, 1, length(a.canonical_symbol)-3),
+                   i.provider, a.canonical_symbol, i.name, i.sector, i.country_code
+            FROM snapshot_holdings h
+            JOIN universe_snapshots s ON s.id = h.snapshot_id
+            JOIN instruments i ON i.id = h.instrument_id
+            JOIN instrument_aliases a ON a.provider_symbol = i.provider_symbol
+            WHERE lower(trim(a.issuer_name)) = lower(trim(i.name))
+              AND i.exchange = 'ASX' AND i.provider = 'yahoo'
+              AND COALESCE(i.country_code, 'AU') IN ('', 'AU')
+              AND s.as_of_date >= a.valid_from AND s.as_of_date < a.valid_until
+            """
+        )
 
     def close(self) -> None:
         self.connection.close()
@@ -641,6 +737,7 @@ class Database:
                         holding.units,
                     ),
                 )
+            self._ensure_canonical_instruments()
             if created_snapshot:
                 predecessor = connection.execute(
                     """
@@ -661,10 +758,10 @@ class Database:
                 if predecessor is not None:
                     outgoing = connection.execute(
                         """
-                        SELECT instrument_id FROM snapshot_holdings
+                        SELECT instrument_id FROM breadth_holdings
                         WHERE snapshot_id = ?
                         EXCEPT
-                        SELECT instrument_id FROM snapshot_holdings
+                        SELECT instrument_id FROM breadth_holdings
                         WHERE snapshot_id = ?
                         """,
                         (predecessor["id"], snapshot_id),
@@ -690,6 +787,7 @@ class Database:
         return self.snapshot(snapshot_id)
 
     def snapshot(self, snapshot_id: int) -> Snapshot:
+        """Return the analytical composition; raw rows stay in snapshot_holdings."""
         row = self.connection.execute(
             """
             SELECT s.id, s.as_of_date, s.source_path, u.id AS universe_id,
@@ -705,7 +803,7 @@ class Database:
         instruments = self.connection.execute(
             """
             SELECT i.id, i.local_symbol, i.provider_symbol, i.name
-            FROM snapshot_holdings h
+            FROM breadth_holdings h
             JOIN instruments i ON i.id = h.instrument_id
             WHERE h.snapshot_id = ?
             ORDER BY i.provider_symbol
@@ -846,7 +944,7 @@ class Database:
             SELECT c.id AS snapshot_id, c.as_of_date AS effective_from,
                    h.instrument_id
             FROM chosen c
-            JOIN snapshot_holdings h ON h.snapshot_id = c.id
+            JOIN breadth_holdings h ON h.snapshot_id = c.id
             ORDER BY c.as_of_date, c.id, h.instrument_id
             """,
             self.connection,
@@ -861,7 +959,7 @@ class Database:
                 SELECT id, universe_id FROM universe_snapshots WHERE id = ?
             ), candidates AS (
                 SELECT h.instrument_id, 1 AS active, NULL AS required_end
-                FROM snapshot_holdings h
+                FROM breadth_holdings h
                 JOIN target t ON t.id = h.snapshot_id
                 UNION ALL
                 SELECT us.instrument_id, 1 AS active, NULL AS required_end
@@ -872,6 +970,13 @@ class Database:
                 FROM sync_requirements r
                 JOIN target t ON t.universe_id = r.universe_id
                 WHERE r.status = 'pending'
+                  AND EXISTS (
+                      SELECT 1 FROM breadth_holdings eligible
+                      JOIN universe_snapshots s ON s.id = eligible.snapshot_id
+                      WHERE eligible.instrument_id = r.instrument_id
+                        AND s.universe_id = r.universe_id
+                        AND s.as_of_date <= r.required_end
+                  )
             )
             SELECT instrument_id, MAX(active) AS active,
                    MAX(required_end) AS required_end
@@ -1632,13 +1737,13 @@ class Database:
                        AS with_history,
                    (
                        SELECT COUNT(DISTINCT failed.instrument_id)
-                       FROM snapshot_holdings failed
+                       FROM breadth_holdings failed
                        JOIN sync_obligation_state o
                          ON o.instrument_id = failed.instrument_id
                        WHERE failed.snapshot_id = ?
                          AND o.last_error IS NOT NULL
                    ) AS provider_failures
-            FROM snapshot_holdings h
+            FROM breadth_holdings h
             LEFT JOIN history_watermarks hw
               ON hw.instrument_id = h.instrument_id
             WHERE h.snapshot_id = ?
@@ -1648,7 +1753,7 @@ class Database:
         unavailable = self.connection.execute(
             """
             SELECT i.local_symbol
-            FROM snapshot_holdings h
+            FROM breadth_holdings h
             JOIN instruments i ON i.id = h.instrument_id
             LEFT JOIN daily_factors f
               ON f.instrument_id = h.instrument_id
@@ -1670,9 +1775,105 @@ class Database:
                 "unavailable_symbols": tuple(
                     item["local_symbol"] for item in unavailable
                 ),
+                "settlement_lines": self.settlement_lines_for_snapshot(snapshot_id),
             }
         )
         return result
+
+    def settlement_lines_for_snapshot(self, snapshot_id: int) -> tuple[str, ...]:
+        rows = self.connection.execute(
+            """
+            SELECT i.local_symbol, parent.local_symbol AS underlying_symbol
+            FROM settlement_holdings h
+            JOIN instruments i ON i.id = h.instrument_id
+            JOIN instruments parent ON parent.id = h.underlying_instrument_id
+            WHERE h.snapshot_id = ? ORDER BY i.local_symbol
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        return tuple(
+            f"{row['local_symbol']} → {row['underlying_symbol']}" for row in rows
+        )
+
+    def cleanup_settlement_cache(self) -> dict[str, int]:
+        """Back up, then purge derived data for redundant settlement instruments.
+
+        Preserve source holdings and fetch-run audit records. An instrument
+        that is eligible in ANY snapshot or used as a market series is not
+        safe to purge globally, even if another snapshot pairs it with a parent.
+        """
+        ids = tuple(
+            row[0]
+            for row in self.connection.execute(
+                """
+                WITH redundant AS (
+                    SELECT instrument_id FROM settlement_holdings
+                    UNION
+                    SELECT source_instrument_id FROM resolved_holdings
+                    WHERE source_instrument_id != instrument_id
+                )
+                SELECT DISTINCT s.instrument_id FROM redundant s
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM breadth_holdings h
+                    WHERE h.instrument_id = s.instrument_id
+                ) AND NOT EXISTS (
+                    SELECT 1 FROM universe_series us
+                    WHERE us.instrument_id = s.instrument_id
+                )
+                """
+            )
+        )
+        if not ids:
+            return {}
+        placeholders = ",".join("?" for _ in ids)
+        tables = (
+            "factor_revisions",
+            "daily_factors",
+            "provider_observations",
+            "history_watermarks",
+            "history_probe_evidence",
+            "empty_history_probe_evidence",
+            "forward_probe_evidence",
+            "sync_requirements",
+            "sync_obligation_state",
+            "instrument_sync_state",
+        )
+        predicates = {table: f"instrument_id IN ({placeholders})" for table in tables}
+        # A temporary-code change is not a removal of the ordinary holding.
+        predicates["sync_requirements"] += """ OR EXISTS (
+            SELECT 1 FROM resolved_holdings h
+            WHERE h.snapshot_id = sync_requirements.snapshot_id
+              AND h.instrument_id = sync_requirements.instrument_id
+              AND h.source_instrument_id != h.instrument_id
+        )"""
+        counts = {
+            table: int(
+                self.connection.execute(
+                    f"SELECT COUNT(*) FROM {table} WHERE {predicates[table]}",
+                    ids,
+                ).fetchone()[0]
+            )
+            for table in tables
+        }
+        if not any(counts.values()):
+            return {}
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S%fZ")
+        backup = self.path.with_name(
+            f"{self.path.stem}.before-settlement-cleanup-{stamp}.sqlite3"
+        )
+        with closing(sqlite3.connect(backup)) as destination:
+            self.connection.backup(destination)
+        logging.info("Cache backup before settlement cleanup: %s", backup)
+        with self.transaction() as connection:
+            for table in tables:
+                connection.execute(
+                    f"DELETE FROM {table} WHERE {predicates[table]}", ids
+                )
+        logging.info(
+            "Removed settlement-only cache records: %s",
+            ", ".join(f"{table}={count}" for table, count in counts.items() if count),
+        )
+        return counts
 
 
 def _holdings_file_issues(
